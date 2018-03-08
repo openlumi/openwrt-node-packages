@@ -1,0 +1,10 @@
+--- a/deps/leveldb/leveldb.gyp
++++ b/deps/leveldb/leveldb.gyp
+@@ -217,7 +217,6 @@
+       , 'leveldb-<(ldbversion)/include/leveldb/table_builder.h'
+       , 'leveldb-<(ldbversion)/include/leveldb/write_batch.h'
+       , 'leveldb-<(ldbversion)/port/port.h'
+-      , 'leveldb-<(ldbversion)/port/port_posix_sse.cc'
+       , 'leveldb-<(ldbversion)/table/block.cc'
+       , 'leveldb-<(ldbversion)/table/block.h'
+       , 'leveldb-<(ldbversion)/table/block_builder.cc'

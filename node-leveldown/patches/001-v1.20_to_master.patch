@@ -1,0 +1,4378 @@
+From 69e2bd224b7f11e021527cb95bab18f1ee6e1b3b Mon Sep 17 00:00:00 2001
+From: costan <costan@google.com>
+Date: Tue, 23 May 2017 17:29:44 -0700
+Subject: [PATCH 01/26] LevelDB: Add WriteBatch::ApproximateSize().
+
+This can be used to report metrics on LevelDB usage.
+
+-------------
+Created by MOE: https://github.com/google/moe
+MOE_MIGRATED_REVID=156934930
+---
+ db/write_batch.cc             |  4 ++++
+ db/write_batch_test.cc        | 17 +++++++++++++++++
+ include/leveldb/write_batch.h |  6 ++++++
+ 3 files changed, 27 insertions(+)
+
+diff --git a/deps/leveldb/leveldb-1.20/db/write_batch.cc b/deps/leveldb/leveldb-1.20/db/write_batch.cc
+index 33f4a4257..7f8f3e8b7 100644
+--- a/deps/leveldb/leveldb-1.20/db/write_batch.cc
++++ b/deps/leveldb/leveldb-1.20/db/write_batch.cc
+@@ -39,6 +39,10 @@ void WriteBatch::Clear() {
+   rep_.resize(kHeader);
+ }
+ 
++size_t WriteBatch::ApproximateSize() {
++  return rep_.size();
++}
++
+ Status WriteBatch::Iterate(Handler* handler) const {
+   Slice input(rep_);
+   if (input.size() < kHeader) {
+diff --git a/deps/leveldb/leveldb-1.20/db/write_batch_test.cc b/deps/leveldb/leveldb-1.20/db/write_batch_test.cc
+index 9064e3d85..8d38023ac 100644
+--- a/deps/leveldb/leveldb-1.20/db/write_batch_test.cc
++++ b/deps/leveldb/leveldb-1.20/db/write_batch_test.cc
+@@ -113,6 +113,23 @@ TEST(WriteBatchTest, Append) {
+             PrintContents(&b1));
+ }
+ 
++TEST(WriteBatchTest, ApproximateSize) {
++  WriteBatch batch;
++  size_t empty_size = batch.ApproximateSize();
++
++  batch.Put(Slice("foo"), Slice("bar"));
++  size_t one_key_size = batch.ApproximateSize();
++  ASSERT_LT(empty_size, one_key_size);
++
++  batch.Put(Slice("baz"), Slice("boo"));
++  size_t two_keys_size = batch.ApproximateSize();
++  ASSERT_LT(one_key_size, two_keys_size);
++
++  batch.Delete(Slice("box"));
++  size_t post_delete_size = batch.ApproximateSize();
++  ASSERT_LT(two_keys_size, post_delete_size);
++}
++
+ }  // namespace leveldb
+ 
+ int main(int argc, char** argv) {
+diff --git a/deps/leveldb/leveldb-1.20/include/leveldb/write_batch.h b/deps/leveldb/leveldb-1.20/include/leveldb/write_batch.h
+index ee9aab68e..65a76d84d 100644
+--- a/deps/leveldb/leveldb-1.20/include/leveldb/write_batch.h
++++ b/deps/leveldb/leveldb-1.20/include/leveldb/write_batch.h
+@@ -42,6 +42,12 @@ class WriteBatch {
+   // Clear all updates buffered in this batch.
+   void Clear();
+ 
++  // The size of the database changes caused by this batch.
++  //
++  // This number is tied to implementation details, and may change across
++  // releases. It is intended for LevelDB usage metrics.
++  size_t ApproximateSize();
++
+   // Support for iterating over the contents of a batch.
+   class Handler {
+    public:
+
+From 8415f00eeedd96934d3578572d3802900e61a556 Mon Sep 17 00:00:00 2001
+From: costan <costan@google.com>
+Date: Mon, 10 Jul 2017 13:32:58 -0700
+Subject: [PATCH 02/26] leveldb: Report missing CURRENT manifest file as
+ database corruption.
+
+BTRFS reorders rename and write operations, so it is possible that a filesystem crash and recovery results in a situation where the file pointed to by CURRENT does not exist. DB::Open currently reports an I/O error in this case. Reporting database corruption is a better hint to the caller, which can attempt to recover the database or erase it and start over.
+
+This issue is not merely theoretical. It was reported as having showed up in the wild at https://github.com/google/leveldb/issues/195 and at https://crbug.com/738961. Also, asides from the BTRFS case described above, incorrect data in CURRENT seems like a possible corruption case that should be handled gracefully.
+
+The Env API changes here can be considered backwards compatible, because an implementation that returns Status::IOError instead of Status::NotFound will still get the same functionality as before.
+
+-------------
+Created by MOE: https://github.com/google/moe
+MOE_MIGRATED_REVID=161432630
+---
+ db/recovery_test.cc   | 21 +++++++++++++++++--
+ db/version_set.cc     |  4 ++++
+ include/leveldb/env.h |  6 ++++--
+ util/env_posix.cc     | 58 +++++++++++++++++++++++++++------------------------
+ util/env_test.cc      | 18 ++++++++++++++++
+ 5 files changed, 76 insertions(+), 31 deletions(-)
+
+diff --git a/deps/leveldb/leveldb-1.20/db/recovery_test.cc b/deps/leveldb/leveldb-1.20/db/recovery_test.cc
+index 9596f4288..e5a7c804a 100644
+--- a/deps/leveldb/leveldb-1.20/db/recovery_test.cc
++++ b/deps/leveldb/leveldb-1.20/db/recovery_test.cc
+@@ -47,7 +47,7 @@ class RecoveryTest {
+     db_ = NULL;
+   }
+ 
+-  void Open(Options* options = NULL) {
++  Status OpenWithStatus(Options* options = NULL) {
+     Close();
+     Options opts;
+     if (options != NULL) {
+@@ -59,7 +59,11 @@ class RecoveryTest {
+     if (opts.env == NULL) {
+       opts.env = env_;
+     }
+-    ASSERT_OK(DB::Open(opts, dbname_, &db_));
++    return DB::Open(opts, dbname_, &db_);
++  }
++
++  void Open(Options* options = NULL) {
++    ASSERT_OK(OpenWithStatus(options));
+     ASSERT_EQ(1, NumLogs());
+   }
+ 
+@@ -100,6 +104,10 @@ class RecoveryTest {
+     return logs.size();
+   }
+ 
++  void DeleteManifestFile() {
++    ASSERT_OK(env_->DeleteFile(ManifestFileName()));
++  }
++
+   uint64_t FirstLogFile() {
+     return GetFiles(kLogFile)[0];
+   }
+@@ -317,6 +325,15 @@ TEST(RecoveryTest, MultipleLogFiles) {
+   ASSERT_EQ("there", Get("hi"));
+ }
+ 
++TEST(RecoveryTest, ManifestMissing) {
++  ASSERT_OK(Put("foo", "bar"));
++  Close();
++  DeleteManifestFile();
++
++  Status status = OpenWithStatus();
++  ASSERT_TRUE(status.IsCorruption());
++}
++
+ }  // namespace leveldb
+ 
+ int main(int argc, char** argv) {
+diff --git a/deps/leveldb/leveldb-1.20/db/version_set.cc b/deps/leveldb/leveldb-1.20/db/version_set.cc
+index b1256f90e..020c37ea2 100644
+--- a/deps/leveldb/leveldb-1.20/db/version_set.cc
++++ b/deps/leveldb/leveldb-1.20/db/version_set.cc
+@@ -925,6 +925,10 @@ Status VersionSet::Recover(bool *save_manifest) {
+   SequentialFile* file;
+   s = env_->NewSequentialFile(dscname, &file);
+   if (!s.ok()) {
++    if (s.IsNotFound()) {
++      return Status::Corruption(
++            "CURRENT points to a non-existent file", s.ToString());
++    }
+     return s;
+   }
+ 
+diff --git a/deps/leveldb/leveldb-1.20/include/leveldb/env.h b/deps/leveldb/leveldb-1.20/include/leveldb/env.h
+index 99b6c2141..cb8b6a465 100644
+--- a/deps/leveldb/leveldb-1.20/include/leveldb/env.h
++++ b/deps/leveldb/leveldb-1.20/include/leveldb/env.h
+@@ -43,7 +43,8 @@ class Env {
+   // Create a brand new sequentially-readable file with the specified name.
+   // On success, stores a pointer to the new file in *result and returns OK.
+   // On failure stores NULL in *result and returns non-OK.  If the file does
+-  // not exist, returns a non-OK status.
++  // not exist, returns a non-OK status.  Implementations should return a
++  // NotFound status when the file does not exist.
+   //
+   // The returned file will only be accessed by one thread at a time.
+   virtual Status NewSequentialFile(const std::string& fname,
+@@ -53,7 +54,8 @@ class Env {
+   // specified name.  On success, stores a pointer to the new file in
+   // *result and returns OK.  On failure stores NULL in *result and
+   // returns non-OK.  If the file does not exist, returns a non-OK
+-  // status.
++  // status.  Implementations should return a NotFound status when the file does
++  // not exist.
+   //
+   // The returned file may be concurrently accessed by multiple threads.
+   virtual Status NewRandomAccessFile(const std::string& fname,
+diff --git a/deps/leveldb/leveldb-1.20/util/env_posix.cc b/deps/leveldb/leveldb-1.20/util/env_posix.cc
+index 84aabb20a..b21f515a3 100644
+--- a/deps/leveldb/leveldb-1.20/util/env_posix.cc
++++ b/deps/leveldb/leveldb-1.20/util/env_posix.cc
+@@ -34,8 +34,12 @@ namespace {
+ static int open_read_only_file_limit = -1;
+ static int mmap_limit = -1;
+ 
+-static Status IOError(const std::string& context, int err_number) {
+-  return Status::IOError(context, strerror(err_number));
++static Status PosixError(const std::string& context, int err_number) {
++  if (err_number == ENOENT) {
++    return Status::NotFound(context, strerror(err_number));
++  } else {
++    return Status::IOError(context, strerror(err_number));
++  }
+ }
+ 
+ // Helper class to limit resource usage to avoid exhaustion.
+@@ -108,7 +112,7 @@ class PosixSequentialFile: public SequentialFile {
+         // We leave status as ok if we hit the end of the file
+       } else {
+         // A partial read with an error: return a non-ok status
+-        s = IOError(filename_, errno);
++        s = PosixError(filename_, errno);
+       }
+     }
+     return s;
+@@ -116,7 +120,7 @@ class PosixSequentialFile: public SequentialFile {
+ 
+   virtual Status Skip(uint64_t n) {
+     if (fseek(file_, n, SEEK_CUR)) {
+-      return IOError(filename_, errno);
++      return PosixError(filename_, errno);
+     }
+     return Status::OK();
+   }
+@@ -154,7 +158,7 @@ class PosixRandomAccessFile: public RandomAccessFile {
+     if (temporary_fd_) {
+       fd = open(filename_.c_str(), O_RDONLY);
+       if (fd < 0) {
+-        return IOError(filename_, errno);
++        return PosixError(filename_, errno);
+       }
+     }
+ 
+@@ -163,7 +167,7 @@ class PosixRandomAccessFile: public RandomAccessFile {
+     *result = Slice(scratch, (r < 0) ? 0 : r);
+     if (r < 0) {
+       // An error: return a non-ok status
+-      s = IOError(filename_, errno);
++      s = PosixError(filename_, errno);
+     }
+     if (temporary_fd_) {
+       // Close the temporary file descriptor opened earlier.
+@@ -199,7 +203,7 @@ class PosixMmapReadableFile: public RandomAccessFile {
+     Status s;
+     if (offset + n > length_) {
+       *result = Slice();
+-      s = IOError(filename_, EINVAL);
++      s = PosixError(filename_, EINVAL);
+     } else {
+       *result = Slice(reinterpret_cast<char*>(mmapped_region_) + offset, n);
+     }
+@@ -226,7 +230,7 @@ class PosixWritableFile : public WritableFile {
+   virtual Status Append(const Slice& data) {
+     size_t r = fwrite_unlocked(data.data(), 1, data.size(), file_);
+     if (r != data.size()) {
+-      return IOError(filename_, errno);
++      return PosixError(filename_, errno);
+     }
+     return Status::OK();
+   }
+@@ -234,7 +238,7 @@ class PosixWritableFile : public WritableFile {
+   virtual Status Close() {
+     Status result;
+     if (fclose(file_) != 0) {
+-      result = IOError(filename_, errno);
++      result = PosixError(filename_, errno);
+     }
+     file_ = NULL;
+     return result;
+@@ -242,7 +246,7 @@ class PosixWritableFile : public WritableFile {
+ 
+   virtual Status Flush() {
+     if (fflush_unlocked(file_) != 0) {
+-      return IOError(filename_, errno);
++      return PosixError(filename_, errno);
+     }
+     return Status::OK();
+   }
+@@ -263,10 +267,10 @@ class PosixWritableFile : public WritableFile {
+     if (basename.starts_with("MANIFEST")) {
+       int fd = open(dir.c_str(), O_RDONLY);
+       if (fd < 0) {
+-        s = IOError(dir, errno);
++        s = PosixError(dir, errno);
+       } else {
+         if (fsync(fd) < 0) {
+-          s = IOError(dir, errno);
++          s = PosixError(dir, errno);
+         }
+         close(fd);
+       }
+@@ -337,7 +341,7 @@ class PosixEnv : public Env {
+     FILE* f = fopen(fname.c_str(), "r");
+     if (f == NULL) {
+       *result = NULL;
+-      return IOError(fname, errno);
++      return PosixError(fname, errno);
+     } else {
+       *result = new PosixSequentialFile(fname, f);
+       return Status::OK();
+@@ -350,7 +354,7 @@ class PosixEnv : public Env {
+     Status s;
+     int fd = open(fname.c_str(), O_RDONLY);
+     if (fd < 0) {
+-      s = IOError(fname, errno);
++      s = PosixError(fname, errno);
+     } else if (mmap_limit_.Acquire()) {
+       uint64_t size;
+       s = GetFileSize(fname, &size);
+@@ -359,7 +363,7 @@ class PosixEnv : public Env {
+         if (base != MAP_FAILED) {
+           *result = new PosixMmapReadableFile(fname, base, size, &mmap_limit_);
+         } else {
+-          s = IOError(fname, errno);
++          s = PosixError(fname, errno);
+         }
+       }
+       close(fd);
+@@ -378,7 +382,7 @@ class PosixEnv : public Env {
+     FILE* f = fopen(fname.c_str(), "w");
+     if (f == NULL) {
+       *result = NULL;
+-      s = IOError(fname, errno);
++      s = PosixError(fname, errno);
+     } else {
+       *result = new PosixWritableFile(fname, f);
+     }
+@@ -391,7 +395,7 @@ class PosixEnv : public Env {
+     FILE* f = fopen(fname.c_str(), "a");
+     if (f == NULL) {
+       *result = NULL;
+-      s = IOError(fname, errno);
++      s = PosixError(fname, errno);
+     } else {
+       *result = new PosixWritableFile(fname, f);
+     }
+@@ -407,7 +411,7 @@ class PosixEnv : public Env {
+     result->clear();
+     DIR* d = opendir(dir.c_str());
+     if (d == NULL) {
+-      return IOError(dir, errno);
++      return PosixError(dir, errno);
+     }
+     struct dirent* entry;
+     while ((entry = readdir(d)) != NULL) {
+@@ -420,7 +424,7 @@ class PosixEnv : public Env {
+   virtual Status DeleteFile(const std::string& fname) {
+     Status result;
+     if (unlink(fname.c_str()) != 0) {
+-      result = IOError(fname, errno);
++      result = PosixError(fname, errno);
+     }
+     return result;
+   }
+@@ -428,7 +432,7 @@ class PosixEnv : public Env {
+   virtual Status CreateDir(const std::string& name) {
+     Status result;
+     if (mkdir(name.c_str(), 0755) != 0) {
+-      result = IOError(name, errno);
++      result = PosixError(name, errno);
+     }
+     return result;
+   }
+@@ -436,7 +440,7 @@ class PosixEnv : public Env {
+   virtual Status DeleteDir(const std::string& name) {
+     Status result;
+     if (rmdir(name.c_str()) != 0) {
+-      result = IOError(name, errno);
++      result = PosixError(name, errno);
+     }
+     return result;
+   }
+@@ -446,7 +450,7 @@ class PosixEnv : public Env {
+     struct stat sbuf;
+     if (stat(fname.c_str(), &sbuf) != 0) {
+       *size = 0;
+-      s = IOError(fname, errno);
++      s = PosixError(fname, errno);
+     } else {
+       *size = sbuf.st_size;
+     }
+@@ -456,7 +460,7 @@ class PosixEnv : public Env {
+   virtual Status RenameFile(const std::string& src, const std::string& target) {
+     Status result;
+     if (rename(src.c_str(), target.c_str()) != 0) {
+-      result = IOError(src, errno);
++      result = PosixError(src, errno);
+     }
+     return result;
+   }
+@@ -466,12 +470,12 @@ class PosixEnv : public Env {
+     Status result;
+     int fd = open(fname.c_str(), O_RDWR | O_CREAT, 0644);
+     if (fd < 0) {
+-      result = IOError(fname, errno);
++      result = PosixError(fname, errno);
+     } else if (!locks_.Insert(fname)) {
+       close(fd);
+       result = Status::IOError("lock " + fname, "already held by process");
+     } else if (LockOrUnlock(fd, true) == -1) {
+-      result = IOError("lock " + fname, errno);
++      result = PosixError("lock " + fname, errno);
+       close(fd);
+       locks_.Remove(fname);
+     } else {
+@@ -487,7 +491,7 @@ class PosixEnv : public Env {
+     PosixFileLock* my_lock = reinterpret_cast<PosixFileLock*>(lock);
+     Status result;
+     if (LockOrUnlock(my_lock->fd_, false) == -1) {
+-      result = IOError("unlock", errno);
++      result = PosixError("unlock", errno);
+     }
+     locks_.Remove(my_lock->name_);
+     close(my_lock->fd_);
+@@ -524,7 +528,7 @@ class PosixEnv : public Env {
+     FILE* f = fopen(fname.c_str(), "w");
+     if (f == NULL) {
+       *result = NULL;
+-      return IOError(fname, errno);
++      return PosixError(fname, errno);
+     } else {
+       *result = new PosixLogger(f, &PosixEnv::gettid);
+       return Status::OK();
+diff --git a/deps/leveldb/leveldb-1.20/util/env_test.cc b/deps/leveldb/leveldb-1.20/util/env_test.cc
+index 839ae56a1..4d8ecc4a7 100644
+--- a/deps/leveldb/leveldb-1.20/util/env_test.cc
++++ b/deps/leveldb/leveldb-1.20/util/env_test.cc
+@@ -99,6 +99,24 @@ TEST(EnvTest, StartThread) {
+   ASSERT_EQ(state.val, 3);
+ }
+ 
++TEST(EnvTest, TestOpenNonExistentFile) {
++  // Write some test data to a single file that will be opened |n| times.
++  std::string test_dir;
++  ASSERT_OK(env_->GetTestDirectory(&test_dir));
++
++  std::string non_existent_file = test_dir + "/non_existent_file";
++  ASSERT_TRUE(!env_->FileExists(non_existent_file));
++
++  RandomAccessFile* random_access_file;
++  Status status = env_->NewRandomAccessFile(
++      non_existent_file, &random_access_file);
++  ASSERT_TRUE(status.IsNotFound());
++
++  SequentialFile* sequential_file;
++  status = env_->NewSequentialFile(non_existent_file, &sequential_file);
++  ASSERT_TRUE(status.IsNotFound());
++}
++
+ }  // namespace leveldb
+ 
+ int main(int argc, char** argv) {
+
+From 0b402e96a76b19cd98e82402de636449a2613228 Mon Sep 17 00:00:00 2001
+From: scrubbed <scrubbed@scrubbed>
+Date: Mon, 24 Jul 2017 10:54:00 -0700
+Subject: [PATCH 03/26] Use __APPLE__ instead of OS_MACOS. The former is
+ compiler-provided.
+
+Use __APPLE__ instead of OS_MACOS when testing for the Apple platform and
+remove the latter symbol from the BUILD file. This fixes incompatibility issues
+when using the library on an Apple device.
+
+-------------
+Created by MOE: https://github.com/google/moe
+MOE_MIGRATED_REVID=162958094
+---
+ build_detect_platform | 4 ++--
+ port/atomic_pointer.h | 4 ++--
+ port/port_posix.h     | 6 +++---
+ 3 files changed, 7 insertions(+), 7 deletions(-)
+
+diff --git a/deps/leveldb/leveldb-1.20/build_detect_platform b/deps/leveldb/leveldb-1.20/build_detect_platform
+index d2a20ce5b..85d359436 100755
+--- a/deps/leveldb/leveldb-1.20/build_detect_platform
++++ b/deps/leveldb/leveldb-1.20/build_detect_platform
+@@ -82,7 +82,7 @@ case "$TARGET_OS" in
+         ;;
+     Darwin)
+         PLATFORM=OS_MACOSX
+-        COMMON_FLAGS="$MEMCMP_FLAG -DOS_MACOSX"
++        COMMON_FLAGS="$MEMCMP_FLAG"
+         PLATFORM_SHARED_EXT=dylib
+         [ -z "$INSTALL_PATH" ] && INSTALL_PATH=`pwd`
+         PLATFORM_SHARED_LDFLAGS="-dynamiclib -install_name $INSTALL_PATH/"
+@@ -150,7 +150,7 @@ case "$TARGET_OS" in
+         ;;
+     IOS)
+         PLATFORM=IOS
+-        COMMON_FLAGS="$MEMCMP_FLAG -DOS_MACOSX"
++        COMMON_FLAGS="$MEMCMP_FLAG"
+         [ -z "$INSTALL_PATH" ] && INSTALL_PATH=`pwd`
+         PORT_FILE=port/port_posix.cc
+         PORT_SSE_FILE=port/port_posix_sse.cc
+diff --git a/deps/leveldb/leveldb-1.20/port/atomic_pointer.h b/deps/leveldb/leveldb-1.20/port/atomic_pointer.h
+index 1c4c7aafc..54f088585 100644
+--- a/deps/leveldb/leveldb-1.20/port/atomic_pointer.h
++++ b/deps/leveldb/leveldb-1.20/port/atomic_pointer.h
+@@ -25,7 +25,7 @@
+ #ifdef OS_WIN
+ #include <windows.h>
+ #endif
+-#ifdef OS_MACOSX
++#ifdef __APPLE__
+ #include <libkern/OSAtomic.h>
+ #endif
+ 
+@@ -54,7 +54,7 @@ namespace port {
+ #define LEVELDB_HAVE_MEMORY_BARRIER
+ 
+ // Mac OS
+-#elif defined(OS_MACOSX)
++#elif defined(__APPLE__)
+ inline void MemoryBarrier() {
+   OSMemoryBarrier();
+ }
+diff --git a/deps/leveldb/leveldb-1.20/port/port_posix.h b/deps/leveldb/leveldb-1.20/port/port_posix.h
+index d67ab68c2..24915512c 100644
+--- a/deps/leveldb/leveldb-1.20/port/port_posix.h
++++ b/deps/leveldb/leveldb-1.20/port/port_posix.h
+@@ -8,7 +8,7 @@
+ #define STORAGE_LEVELDB_PORT_PORT_POSIX_H_
+ 
+ #undef PLATFORM_IS_LITTLE_ENDIAN
+-#if defined(OS_MACOSX)
++#if defined(__APPLE__)
+   #include <machine/endian.h>
+   #if defined(__DARWIN_LITTLE_ENDIAN) && defined(__DARWIN_BYTE_ORDER)
+     #define PLATFORM_IS_LITTLE_ENDIAN \
+@@ -50,7 +50,7 @@
+ #define PLATFORM_IS_LITTLE_ENDIAN (__BYTE_ORDER == __LITTLE_ENDIAN)
+ #endif
+ 
+-#if defined(OS_MACOSX) || defined(OS_SOLARIS) || defined(OS_FREEBSD) ||\
++#if defined(__APPLE__) || defined(OS_SOLARIS) || defined(OS_FREEBSD) ||\
+     defined(OS_NETBSD) || defined(OS_OPENBSD) || defined(OS_DRAGONFLYBSD) ||\
+     defined(OS_ANDROID) || defined(OS_HPUX) || defined(CYGWIN)
+ // Use fread/fwrite/fflush on platforms without _unlocked variants
+@@ -59,7 +59,7 @@
+ #define fflush_unlocked fflush
+ #endif
+ 
+-#if defined(OS_MACOSX) || defined(OS_FREEBSD) ||\
++#if defined(__APPLE__) || defined(OS_FREEBSD) ||\
+     defined(OS_OPENBSD) || defined(OS_DRAGONFLYBSD)
+ // Use fsync() on platforms without fdatasync()
+ #define fdatasync fsync
+
+From 02f43c0fcde39823830493503e8a3f72fed43d24 Mon Sep 17 00:00:00 2001
+From: davidair <davidair@google.com>
+Date: Thu, 3 Aug 2017 13:42:12 -0700
+Subject: [PATCH 04/26] Remove dead code.
+
+The dead code has been in the codebase since the initial commit and is
+generating a compiler warning when used in Xcode.
+
+-------------
+Created by MOE: https://github.com/google/moe
+MOE_MIGRATED_REVID=164174594
+---
+ db/version_set.cc | 7 -------
+ 1 file changed, 7 deletions(-)
+
+diff --git a/deps/leveldb/leveldb-1.20/db/version_set.cc b/deps/leveldb/leveldb-1.20/db/version_set.cc
+index 020c37ea2..7022b274e 100644
+--- a/deps/leveldb/leveldb-1.20/db/version_set.cc
++++ b/deps/leveldb/leveldb-1.20/db/version_set.cc
+@@ -1399,13 +1399,6 @@ void VersionSet::SetupOtherInputs(Compaction* c) {
+                                    &c->grandparents_);
+   }
+ 
+-  if (false) {
+-    Log(options_->info_log, "Compacting %d '%s' .. '%s'",
+-        level,
+-        smallest.DebugString().c_str(),
+-        largest.DebugString().c_str());
+-  }
+-
+   // Update the place where we will do the next compaction for this level.
+   // We update this immediately instead of waiting for the VersionEdit
+   // to be applied so that if the compaction fails, we will try a different
+
+From 2964b803b857932ff7499d7bebb61dc5514dab7c Mon Sep 17 00:00:00 2001
+From: costan <costan@google.com>
+Date: Wed, 23 Aug 2017 20:59:46 -0700
+Subject: [PATCH 05/26] leveldb: Fix alignment code in SSE4.2-optimized CRC32C.
+
+When faced with a pointer that is misaligned by K bytes (pointer % 8 ==
+K), the code previously moved forward by K bytes. In order to end up
+with an aligned pointer, the code must move by 8 - K bytes.
+
+This lands https://github.com/google/leveldb/pull/488
+
+-------------
+Created by MOE: https://github.com/google/moe
+MOE_MIGRATED_REVID=166295921
+---
+ port/port_posix_sse.cc | 8 ++++++--
+ 1 file changed, 6 insertions(+), 2 deletions(-)
+
+diff --git a/deps/leveldb/leveldb-1.20/port/port_posix_sse.cc b/deps/leveldb/leveldb-1.20/port/port_posix_sse.cc
+index 1e519ba0b..08d9aee1e 100644
+--- a/deps/leveldb/leveldb-1.20/port/port_posix_sse.cc
++++ b/deps/leveldb/leveldb-1.20/port/port_posix_sse.cc
+@@ -92,8 +92,12 @@ uint32_t AcceleratedCRC32C(uint32_t crc, const char* buf, size_t size) {
+ } while (0)
+ 
+   if (size > 16) {
+-    // Process unaligned bytes
+-    for (unsigned int i = reinterpret_cast<uintptr_t>(p) % 8; i; --i) {
++    // Point x at first 8-byte aligned byte in string. This must be inside the
++    // string, due to the size check above.
++    const uintptr_t pval = reinterpret_cast<uintptr_t>(p);
++    const uint8_t* x = reinterpret_cast<const uint8_t*>(((pval + 7) >> 3) << 3);
++    // Process bytes until p is 8-byte aligned.
++    while (p != x) {
+       STEP1;
+     }
+ 
+
+From 09a3c8e7417547829b94bcdaa62cdf9e896f29a9 Mon Sep 17 00:00:00 2001
+From: cmumford <cmumford@google.com>
+Date: Thu, 20 Jul 2017 15:00:13 -0700
+Subject: [PATCH 06/26] Switched variable type from int to uint64_t in
+ ConsumeDecimalNumber.
+
+An Android test was occasionally crashing with a SEGV in ConsumeDecimalNumber
+Switching a local variable from an int to uint64_t eliminated these crashes.
+Speculating this is either a compiler, runtime library, or emulator issue.
+
+Switching this type to uint64_t also eliminates a compiler warning
+about comparing an int with a uint64_t.
+
+-------------
+Created by MOE: https://github.com/google/moe
+MOE_MIGRATED_REVID=166399695
+---
+ util/logging.cc | 3 ++-
+ 1 file changed, 2 insertions(+), 1 deletion(-)
+
+diff --git a/deps/leveldb/leveldb-1.20/util/logging.cc b/deps/leveldb/leveldb-1.20/util/logging.cc
+index ca6b32440..d48b6dd28 100644
+--- a/deps/leveldb/leveldb-1.20/util/logging.cc
++++ b/deps/leveldb/leveldb-1.20/util/logging.cc
+@@ -52,7 +52,8 @@ bool ConsumeDecimalNumber(Slice* in, uint64_t* val) {
+     char c = (*in)[0];
+     if (c >= '0' && c <= '9') {
+       ++digits;
+-      const int delta = (c - '0');
++      // |delta| intentionally unit64_t to avoid Android crash (see log).
++      const uint64_t delta = (c - '0');
+       static const uint64_t kMaxUint64 = ~static_cast<uint64_t>(0);
+       if (v > kMaxUint64/10 ||
+           (v == kMaxUint64/10 && delta > kMaxUint64%10)) {
+
+From 141e7671359d5e6c65ff70460774b53b94371df1 Mon Sep 17 00:00:00 2001
+From: costan <costan@google.com>
+Date: Fri, 1 Sep 2017 11:44:05 -0700
+Subject: [PATCH 07/26] Simplify Table::Open() flow and remove a delete call.
+
+-------------
+Created by MOE: https://github.com/google/moe
+MOE_MIGRATED_REVID=167303843
+---
+ table/table.cc | 11 +++--------
+ 1 file changed, 3 insertions(+), 8 deletions(-)
+
+diff --git a/deps/leveldb/leveldb-1.20/table/table.cc b/deps/leveldb/leveldb-1.20/table/table.cc
+index decf8082c..ff73ceedd 100644
+--- a/deps/leveldb/leveldb-1.20/table/table.cc
++++ b/deps/leveldb/leveldb-1.20/table/table.cc
+@@ -55,22 +55,19 @@ Status Table::Open(const Options& options,
+   if (!s.ok()) return s;
+ 
+   // Read the index block
+-  BlockContents contents;
+-  Block* index_block = NULL;
++  BlockContents index_block_contents;
+   if (s.ok()) {
+     ReadOptions opt;
+     if (options.paranoid_checks) {
+       opt.verify_checksums = true;
+     }
+-    s = ReadBlock(file, opt, footer.index_handle(), &contents);
+-    if (s.ok()) {
+-      index_block = new Block(contents);
+-    }
++    s = ReadBlock(file, opt, footer.index_handle(), &index_block_contents);
+   }
+ 
+   if (s.ok()) {
+     // We've successfully read the footer and the index block: we're
+     // ready to serve requests.
++    Block* index_block = new Block(index_block_contents);
+     Rep* rep = new Table::Rep;
+     rep->options = options;
+     rep->file = file;
+@@ -81,8 +78,6 @@ Status Table::Open(const Options& options,
+     rep->filter = NULL;
+     *table = new Table(rep);
+     (*table)->ReadMeta(footer);
+-  } else {
+-    delete index_block;
+   }
+ 
+   return s;
+
+From ea0a7586b8615fd39c6b8f5a8a21a1f242129c2f Mon Sep 17 00:00:00 2001
+From: costan <costan@google.com>
+Date: Fri, 1 Sep 2017 14:36:20 -0700
+Subject: [PATCH 08/26] Remove confusing and unnecessary if.
+
+12 lines above, there is an "if (!s.ok()) { return s; }" block of code.
+"s" is never modified between that block and the "if" removed by this
+CL, so "s.ok()" must be true.
+
+The code most likely intended to say "if (!builder->ok())", because the
+builder->Add() call above can modify the TableBuilder's status, as a
+side-effect. However, this approach would have required setting "s =
+builder.status()" in the "else" branch, near the "builder.Abandon()"
+call. So, removing the "if" outright is simpler than following that line
+of thought.
+
+-------------
+Created by MOE: https://github.com/google/moe
+MOE_MIGRATED_REVID=167326229
+---
+ db/builder.cc | 10 +++-------
+ 1 file changed, 3 insertions(+), 7 deletions(-)
+
+diff --git a/deps/leveldb/leveldb-1.20/db/builder.cc b/deps/leveldb/leveldb-1.20/db/builder.cc
+index f41988219..729f9fd4a 100644
+--- a/deps/leveldb/leveldb-1.20/db/builder.cc
++++ b/deps/leveldb/leveldb-1.20/db/builder.cc
+@@ -41,14 +41,10 @@ Status BuildTable(const std::string& dbname,
+     }
+ 
+     // Finish and check for builder errors
++    s = builder->Finish();
+     if (s.ok()) {
+-      s = builder->Finish();
+-      if (s.ok()) {
+-        meta->file_size = builder->FileSize();
+-        assert(meta->file_size > 0);
+-      }
+-    } else {
+-      builder->Abandon();
++      meta->file_size = builder->FileSize();
++      assert(meta->file_size > 0);
+     }
+     delete builder;
+ 
+
+From bcd9a8ea4a8aad23a3e101a23c61615bab2a093f Mon Sep 17 00:00:00 2001
+From: costan <costan@google.com>
+Date: Tue, 26 Sep 2017 13:32:01 -0700
+Subject: [PATCH 09/26] Use portable CRC32C from google/crc32c.
+
+Benchmark results below. More results at
+https://github.com/google/crc32c/commit/354d61ef97eb73d4f0c1694cac6ec6116a5543e4.
+
+New, MacBookPro13,3 with Core i7 6920HQ:
+LevelDB:    version 1.20
+Keys:       16 bytes each
+Values:     100 bytes each (50 bytes after compression)
+Entries:    1000000
+RawSize:    110.6 MB (estimated)
+FileSize:   62.9 MB (estimated)
+WARNING: Snappy compression is not enabled
+------------------------------------------------
+fillseq      :       2.952 micros/op;   37.5 MB/s
+fillsync     :      43.932 micros/op;    2.5 MB/s (1000 ops)
+fillrandom   :       3.856 micros/op;   28.7 MB/s
+overwrite    :       4.053 micros/op;   27.3 MB/s
+readrandom   :       4.234 micros/op; (1000000 of 1000000 found)
+readrandom   :       3.923 micros/op; (1000000 of 1000000 found)
+readseq      :       0.201 micros/op;  550.8 MB/s
+readreverse  :       0.356 micros/op;  310.6 MB/s
+compact      :  436800.000 micros/op;
+readrandom   :       2.375 micros/op; (1000000 of 1000000 found)
+readseq      :       0.151 micros/op;  734.3 MB/s
+readreverse  :       0.298 micros/op;  370.7 MB/s
+fill100K     :     554.075 micros/op;  172.1 MB/s (1000 ops)
+crc32c       :       1.393 micros/op; 2805.0 MB/s (4K per op)
+snappycomp   :    3902.000 micros/op; (snappy failure)
+snappyuncomp :    3821.000 micros/op; (snappy failure)
+acquireload  :      13.088 micros/op; (each op is 1000 loads)
+
+Baseline, MacBookPro13,3 with Core i7 6920HQ:
+LevelDB:    version 1.20
+Keys:       16 bytes each
+Values:     100 bytes each (50 bytes after compression)
+Entries:    1000000
+RawSize:    110.6 MB (estimated)
+FileSize:   62.9 MB (estimated)
+WARNING: Snappy compression is not enabled
+------------------------------------------------
+fillseq      :       3.000 micros/op;   36.9 MB/s
+fillsync     :      46.721 micros/op;    2.4 MB/s (1000 ops)
+fillrandom   :       3.922 micros/op;   28.2 MB/s
+overwrite    :       4.080 micros/op;   27.1 MB/s
+readrandom   :       4.409 micros/op; (1000000 of 1000000 found)
+readrandom   :       3.895 micros/op; (1000000 of 1000000 found)
+readseq      :       0.190 micros/op;  582.4 MB/s
+readreverse  :       0.413 micros/op;  267.6 MB/s
+compact      :  441076.000 micros/op;
+readrandom   :       2.308 micros/op; (1000000 of 1000000 found)
+readseq      :       0.170 micros/op;  651.2 MB/s
+readreverse  :       0.302 micros/op;  366.2 MB/s
+fill100K     :     614.289 micros/op;  155.3 MB/s (1000 ops)
+crc32c       :       3.547 micros/op; 1101.2 MB/s (4K per op)
+snappycomp   :    3393.000 micros/op; (snappy failure)
+snappyuncomp :    3171.000 micros/op; (snappy failure)
+acquireload  :      12.761 micros/op; (each op is 1000 loads)
+
+-------------
+Created by MOE: https://github.com/google/moe
+MOE_MIGRATED_REVID=170100372
+---
+ util/crc32c.cc | 626 ++++++++++++++++++++++++++++++---------------------------
+ 1 file changed, 328 insertions(+), 298 deletions(-)
+
+diff --git a/deps/leveldb/leveldb-1.20/util/crc32c.cc b/deps/leveldb/leveldb-1.20/util/crc32c.cc
+index edd61cfd6..4f1d80fb0 100644
+--- a/deps/leveldb/leveldb-1.20/util/crc32c.cc
++++ b/deps/leveldb/leveldb-1.20/util/crc32c.cc
+@@ -2,11 +2,11 @@
+ // Use of this source code is governed by a BSD-style license that can be
+ // found in the LICENSE file. See the AUTHORS file for names of contributors.
+ //
+-// A portable implementation of crc32c, optimized to handle
+-// four bytes at a time.
++// A portable implementation of crc32c.
+ 
+ #include "util/crc32c.h"
+ 
++#include <stddef.h>
+ #include <stdint.h>
+ 
+ #include "port/port.h"
+@@ -15,276 +15,253 @@
+ namespace leveldb {
+ namespace crc32c {
+ 
+-static const uint32_t table0_[256] = {
+-  0x00000000, 0xf26b8303, 0xe13b70f7, 0x1350f3f4,
+-  0xc79a971f, 0x35f1141c, 0x26a1e7e8, 0xd4ca64eb,
+-  0x8ad958cf, 0x78b2dbcc, 0x6be22838, 0x9989ab3b,
+-  0x4d43cfd0, 0xbf284cd3, 0xac78bf27, 0x5e133c24,
+-  0x105ec76f, 0xe235446c, 0xf165b798, 0x030e349b,
+-  0xd7c45070, 0x25afd373, 0x36ff2087, 0xc494a384,
+-  0x9a879fa0, 0x68ec1ca3, 0x7bbcef57, 0x89d76c54,
+-  0x5d1d08bf, 0xaf768bbc, 0xbc267848, 0x4e4dfb4b,
+-  0x20bd8ede, 0xd2d60ddd, 0xc186fe29, 0x33ed7d2a,
+-  0xe72719c1, 0x154c9ac2, 0x061c6936, 0xf477ea35,
+-  0xaa64d611, 0x580f5512, 0x4b5fa6e6, 0xb93425e5,
+-  0x6dfe410e, 0x9f95c20d, 0x8cc531f9, 0x7eaeb2fa,
+-  0x30e349b1, 0xc288cab2, 0xd1d83946, 0x23b3ba45,
+-  0xf779deae, 0x05125dad, 0x1642ae59, 0xe4292d5a,
+-  0xba3a117e, 0x4851927d, 0x5b016189, 0xa96ae28a,
+-  0x7da08661, 0x8fcb0562, 0x9c9bf696, 0x6ef07595,
+-  0x417b1dbc, 0xb3109ebf, 0xa0406d4b, 0x522bee48,
+-  0x86e18aa3, 0x748a09a0, 0x67dafa54, 0x95b17957,
+-  0xcba24573, 0x39c9c670, 0x2a993584, 0xd8f2b687,
+-  0x0c38d26c, 0xfe53516f, 0xed03a29b, 0x1f682198,
+-  0x5125dad3, 0xa34e59d0, 0xb01eaa24, 0x42752927,
+-  0x96bf4dcc, 0x64d4cecf, 0x77843d3b, 0x85efbe38,
+-  0xdbfc821c, 0x2997011f, 0x3ac7f2eb, 0xc8ac71e8,
+-  0x1c661503, 0xee0d9600, 0xfd5d65f4, 0x0f36e6f7,
+-  0x61c69362, 0x93ad1061, 0x80fde395, 0x72966096,
+-  0xa65c047d, 0x5437877e, 0x4767748a, 0xb50cf789,
+-  0xeb1fcbad, 0x197448ae, 0x0a24bb5a, 0xf84f3859,
+-  0x2c855cb2, 0xdeeedfb1, 0xcdbe2c45, 0x3fd5af46,
+-  0x7198540d, 0x83f3d70e, 0x90a324fa, 0x62c8a7f9,
+-  0xb602c312, 0x44694011, 0x5739b3e5, 0xa55230e6,
+-  0xfb410cc2, 0x092a8fc1, 0x1a7a7c35, 0xe811ff36,
+-  0x3cdb9bdd, 0xceb018de, 0xdde0eb2a, 0x2f8b6829,
+-  0x82f63b78, 0x709db87b, 0x63cd4b8f, 0x91a6c88c,
+-  0x456cac67, 0xb7072f64, 0xa457dc90, 0x563c5f93,
+-  0x082f63b7, 0xfa44e0b4, 0xe9141340, 0x1b7f9043,
+-  0xcfb5f4a8, 0x3dde77ab, 0x2e8e845f, 0xdce5075c,
+-  0x92a8fc17, 0x60c37f14, 0x73938ce0, 0x81f80fe3,
+-  0x55326b08, 0xa759e80b, 0xb4091bff, 0x466298fc,
+-  0x1871a4d8, 0xea1a27db, 0xf94ad42f, 0x0b21572c,
+-  0xdfeb33c7, 0x2d80b0c4, 0x3ed04330, 0xccbbc033,
+-  0xa24bb5a6, 0x502036a5, 0x4370c551, 0xb11b4652,
+-  0x65d122b9, 0x97baa1ba, 0x84ea524e, 0x7681d14d,
+-  0x2892ed69, 0xdaf96e6a, 0xc9a99d9e, 0x3bc21e9d,
+-  0xef087a76, 0x1d63f975, 0x0e330a81, 0xfc588982,
+-  0xb21572c9, 0x407ef1ca, 0x532e023e, 0xa145813d,
+-  0x758fe5d6, 0x87e466d5, 0x94b49521, 0x66df1622,
+-  0x38cc2a06, 0xcaa7a905, 0xd9f75af1, 0x2b9cd9f2,
+-  0xff56bd19, 0x0d3d3e1a, 0x1e6dcdee, 0xec064eed,
+-  0xc38d26c4, 0x31e6a5c7, 0x22b65633, 0xd0ddd530,
+-  0x0417b1db, 0xf67c32d8, 0xe52cc12c, 0x1747422f,
+-  0x49547e0b, 0xbb3ffd08, 0xa86f0efc, 0x5a048dff,
+-  0x8ecee914, 0x7ca56a17, 0x6ff599e3, 0x9d9e1ae0,
+-  0xd3d3e1ab, 0x21b862a8, 0x32e8915c, 0xc083125f,
+-  0x144976b4, 0xe622f5b7, 0xf5720643, 0x07198540,
+-  0x590ab964, 0xab613a67, 0xb831c993, 0x4a5a4a90,
+-  0x9e902e7b, 0x6cfbad78, 0x7fab5e8c, 0x8dc0dd8f,
+-  0xe330a81a, 0x115b2b19, 0x020bd8ed, 0xf0605bee,
+-  0x24aa3f05, 0xd6c1bc06, 0xc5914ff2, 0x37faccf1,
+-  0x69e9f0d5, 0x9b8273d6, 0x88d28022, 0x7ab90321,
+-  0xae7367ca, 0x5c18e4c9, 0x4f48173d, 0xbd23943e,
+-  0xf36e6f75, 0x0105ec76, 0x12551f82, 0xe03e9c81,
+-  0x34f4f86a, 0xc69f7b69, 0xd5cf889d, 0x27a40b9e,
+-  0x79b737ba, 0x8bdcb4b9, 0x988c474d, 0x6ae7c44e,
+-  0xbe2da0a5, 0x4c4623a6, 0x5f16d052, 0xad7d5351
+-};
+-static const uint32_t table1_[256] = {
+-  0x00000000, 0x13a29877, 0x274530ee, 0x34e7a899,
+-  0x4e8a61dc, 0x5d28f9ab, 0x69cf5132, 0x7a6dc945,
+-  0x9d14c3b8, 0x8eb65bcf, 0xba51f356, 0xa9f36b21,
+-  0xd39ea264, 0xc03c3a13, 0xf4db928a, 0xe7790afd,
+-  0x3fc5f181, 0x2c6769f6, 0x1880c16f, 0x0b225918,
+-  0x714f905d, 0x62ed082a, 0x560aa0b3, 0x45a838c4,
+-  0xa2d13239, 0xb173aa4e, 0x859402d7, 0x96369aa0,
+-  0xec5b53e5, 0xfff9cb92, 0xcb1e630b, 0xd8bcfb7c,
+-  0x7f8be302, 0x6c297b75, 0x58ced3ec, 0x4b6c4b9b,
+-  0x310182de, 0x22a31aa9, 0x1644b230, 0x05e62a47,
+-  0xe29f20ba, 0xf13db8cd, 0xc5da1054, 0xd6788823,
+-  0xac154166, 0xbfb7d911, 0x8b507188, 0x98f2e9ff,
+-  0x404e1283, 0x53ec8af4, 0x670b226d, 0x74a9ba1a,
+-  0x0ec4735f, 0x1d66eb28, 0x298143b1, 0x3a23dbc6,
+-  0xdd5ad13b, 0xcef8494c, 0xfa1fe1d5, 0xe9bd79a2,
+-  0x93d0b0e7, 0x80722890, 0xb4958009, 0xa737187e,
+-  0xff17c604, 0xecb55e73, 0xd852f6ea, 0xcbf06e9d,
+-  0xb19da7d8, 0xa23f3faf, 0x96d89736, 0x857a0f41,
+-  0x620305bc, 0x71a19dcb, 0x45463552, 0x56e4ad25,
+-  0x2c896460, 0x3f2bfc17, 0x0bcc548e, 0x186eccf9,
+-  0xc0d23785, 0xd370aff2, 0xe797076b, 0xf4359f1c,
+-  0x8e585659, 0x9dface2e, 0xa91d66b7, 0xbabffec0,
+-  0x5dc6f43d, 0x4e646c4a, 0x7a83c4d3, 0x69215ca4,
+-  0x134c95e1, 0x00ee0d96, 0x3409a50f, 0x27ab3d78,
+-  0x809c2506, 0x933ebd71, 0xa7d915e8, 0xb47b8d9f,
+-  0xce1644da, 0xddb4dcad, 0xe9537434, 0xfaf1ec43,
+-  0x1d88e6be, 0x0e2a7ec9, 0x3acdd650, 0x296f4e27,
+-  0x53028762, 0x40a01f15, 0x7447b78c, 0x67e52ffb,
+-  0xbf59d487, 0xacfb4cf0, 0x981ce469, 0x8bbe7c1e,
+-  0xf1d3b55b, 0xe2712d2c, 0xd69685b5, 0xc5341dc2,
+-  0x224d173f, 0x31ef8f48, 0x050827d1, 0x16aabfa6,
+-  0x6cc776e3, 0x7f65ee94, 0x4b82460d, 0x5820de7a,
+-  0xfbc3faf9, 0xe861628e, 0xdc86ca17, 0xcf245260,
+-  0xb5499b25, 0xa6eb0352, 0x920cabcb, 0x81ae33bc,
+-  0x66d73941, 0x7575a136, 0x419209af, 0x523091d8,
+-  0x285d589d, 0x3bffc0ea, 0x0f186873, 0x1cbaf004,
+-  0xc4060b78, 0xd7a4930f, 0xe3433b96, 0xf0e1a3e1,
+-  0x8a8c6aa4, 0x992ef2d3, 0xadc95a4a, 0xbe6bc23d,
+-  0x5912c8c0, 0x4ab050b7, 0x7e57f82e, 0x6df56059,
+-  0x1798a91c, 0x043a316b, 0x30dd99f2, 0x237f0185,
+-  0x844819fb, 0x97ea818c, 0xa30d2915, 0xb0afb162,
+-  0xcac27827, 0xd960e050, 0xed8748c9, 0xfe25d0be,
+-  0x195cda43, 0x0afe4234, 0x3e19eaad, 0x2dbb72da,
+-  0x57d6bb9f, 0x447423e8, 0x70938b71, 0x63311306,
+-  0xbb8de87a, 0xa82f700d, 0x9cc8d894, 0x8f6a40e3,
+-  0xf50789a6, 0xe6a511d1, 0xd242b948, 0xc1e0213f,
+-  0x26992bc2, 0x353bb3b5, 0x01dc1b2c, 0x127e835b,
+-  0x68134a1e, 0x7bb1d269, 0x4f567af0, 0x5cf4e287,
+-  0x04d43cfd, 0x1776a48a, 0x23910c13, 0x30339464,
+-  0x4a5e5d21, 0x59fcc556, 0x6d1b6dcf, 0x7eb9f5b8,
+-  0x99c0ff45, 0x8a626732, 0xbe85cfab, 0xad2757dc,
+-  0xd74a9e99, 0xc4e806ee, 0xf00fae77, 0xe3ad3600,
+-  0x3b11cd7c, 0x28b3550b, 0x1c54fd92, 0x0ff665e5,
+-  0x759baca0, 0x663934d7, 0x52de9c4e, 0x417c0439,
+-  0xa6050ec4, 0xb5a796b3, 0x81403e2a, 0x92e2a65d,
+-  0xe88f6f18, 0xfb2df76f, 0xcfca5ff6, 0xdc68c781,
+-  0x7b5fdfff, 0x68fd4788, 0x5c1aef11, 0x4fb87766,
+-  0x35d5be23, 0x26772654, 0x12908ecd, 0x013216ba,
+-  0xe64b1c47, 0xf5e98430, 0xc10e2ca9, 0xd2acb4de,
+-  0xa8c17d9b, 0xbb63e5ec, 0x8f844d75, 0x9c26d502,
+-  0x449a2e7e, 0x5738b609, 0x63df1e90, 0x707d86e7,
+-  0x0a104fa2, 0x19b2d7d5, 0x2d557f4c, 0x3ef7e73b,
+-  0xd98eedc6, 0xca2c75b1, 0xfecbdd28, 0xed69455f,
+-  0x97048c1a, 0x84a6146d, 0xb041bcf4, 0xa3e32483
+-};
+-static const uint32_t table2_[256] = {
+-  0x00000000, 0xa541927e, 0x4f6f520d, 0xea2ec073,
+-  0x9edea41a, 0x3b9f3664, 0xd1b1f617, 0x74f06469,
+-  0x38513ec5, 0x9d10acbb, 0x773e6cc8, 0xd27ffeb6,
+-  0xa68f9adf, 0x03ce08a1, 0xe9e0c8d2, 0x4ca15aac,
+-  0x70a27d8a, 0xd5e3eff4, 0x3fcd2f87, 0x9a8cbdf9,
+-  0xee7cd990, 0x4b3d4bee, 0xa1138b9d, 0x045219e3,
+-  0x48f3434f, 0xedb2d131, 0x079c1142, 0xa2dd833c,
+-  0xd62de755, 0x736c752b, 0x9942b558, 0x3c032726,
+-  0xe144fb14, 0x4405696a, 0xae2ba919, 0x0b6a3b67,
+-  0x7f9a5f0e, 0xdadbcd70, 0x30f50d03, 0x95b49f7d,
+-  0xd915c5d1, 0x7c5457af, 0x967a97dc, 0x333b05a2,
+-  0x47cb61cb, 0xe28af3b5, 0x08a433c6, 0xade5a1b8,
+-  0x91e6869e, 0x34a714e0, 0xde89d493, 0x7bc846ed,
+-  0x0f382284, 0xaa79b0fa, 0x40577089, 0xe516e2f7,
+-  0xa9b7b85b, 0x0cf62a25, 0xe6d8ea56, 0x43997828,
+-  0x37691c41, 0x92288e3f, 0x78064e4c, 0xdd47dc32,
+-  0xc76580d9, 0x622412a7, 0x880ad2d4, 0x2d4b40aa,
+-  0x59bb24c3, 0xfcfab6bd, 0x16d476ce, 0xb395e4b0,
+-  0xff34be1c, 0x5a752c62, 0xb05bec11, 0x151a7e6f,
+-  0x61ea1a06, 0xc4ab8878, 0x2e85480b, 0x8bc4da75,
+-  0xb7c7fd53, 0x12866f2d, 0xf8a8af5e, 0x5de93d20,
+-  0x29195949, 0x8c58cb37, 0x66760b44, 0xc337993a,
+-  0x8f96c396, 0x2ad751e8, 0xc0f9919b, 0x65b803e5,
+-  0x1148678c, 0xb409f5f2, 0x5e273581, 0xfb66a7ff,
+-  0x26217bcd, 0x8360e9b3, 0x694e29c0, 0xcc0fbbbe,
+-  0xb8ffdfd7, 0x1dbe4da9, 0xf7908dda, 0x52d11fa4,
+-  0x1e704508, 0xbb31d776, 0x511f1705, 0xf45e857b,
+-  0x80aee112, 0x25ef736c, 0xcfc1b31f, 0x6a802161,
+-  0x56830647, 0xf3c29439, 0x19ec544a, 0xbcadc634,
+-  0xc85da25d, 0x6d1c3023, 0x8732f050, 0x2273622e,
+-  0x6ed23882, 0xcb93aafc, 0x21bd6a8f, 0x84fcf8f1,
+-  0xf00c9c98, 0x554d0ee6, 0xbf63ce95, 0x1a225ceb,
+-  0x8b277743, 0x2e66e53d, 0xc448254e, 0x6109b730,
+-  0x15f9d359, 0xb0b84127, 0x5a968154, 0xffd7132a,
+-  0xb3764986, 0x1637dbf8, 0xfc191b8b, 0x595889f5,
+-  0x2da8ed9c, 0x88e97fe2, 0x62c7bf91, 0xc7862def,
+-  0xfb850ac9, 0x5ec498b7, 0xb4ea58c4, 0x11abcaba,
+-  0x655baed3, 0xc01a3cad, 0x2a34fcde, 0x8f756ea0,
+-  0xc3d4340c, 0x6695a672, 0x8cbb6601, 0x29faf47f,
+-  0x5d0a9016, 0xf84b0268, 0x1265c21b, 0xb7245065,
+-  0x6a638c57, 0xcf221e29, 0x250cde5a, 0x804d4c24,
+-  0xf4bd284d, 0x51fcba33, 0xbbd27a40, 0x1e93e83e,
+-  0x5232b292, 0xf77320ec, 0x1d5de09f, 0xb81c72e1,
+-  0xccec1688, 0x69ad84f6, 0x83834485, 0x26c2d6fb,
+-  0x1ac1f1dd, 0xbf8063a3, 0x55aea3d0, 0xf0ef31ae,
+-  0x841f55c7, 0x215ec7b9, 0xcb7007ca, 0x6e3195b4,
+-  0x2290cf18, 0x87d15d66, 0x6dff9d15, 0xc8be0f6b,
+-  0xbc4e6b02, 0x190ff97c, 0xf321390f, 0x5660ab71,
+-  0x4c42f79a, 0xe90365e4, 0x032da597, 0xa66c37e9,
+-  0xd29c5380, 0x77ddc1fe, 0x9df3018d, 0x38b293f3,
+-  0x7413c95f, 0xd1525b21, 0x3b7c9b52, 0x9e3d092c,
+-  0xeacd6d45, 0x4f8cff3b, 0xa5a23f48, 0x00e3ad36,
+-  0x3ce08a10, 0x99a1186e, 0x738fd81d, 0xd6ce4a63,
+-  0xa23e2e0a, 0x077fbc74, 0xed517c07, 0x4810ee79,
+-  0x04b1b4d5, 0xa1f026ab, 0x4bdee6d8, 0xee9f74a6,
+-  0x9a6f10cf, 0x3f2e82b1, 0xd50042c2, 0x7041d0bc,
+-  0xad060c8e, 0x08479ef0, 0xe2695e83, 0x4728ccfd,
+-  0x33d8a894, 0x96993aea, 0x7cb7fa99, 0xd9f668e7,
+-  0x9557324b, 0x3016a035, 0xda386046, 0x7f79f238,
+-  0x0b899651, 0xaec8042f, 0x44e6c45c, 0xe1a75622,
+-  0xdda47104, 0x78e5e37a, 0x92cb2309, 0x378ab177,
+-  0x437ad51e, 0xe63b4760, 0x0c158713, 0xa954156d,
+-  0xe5f54fc1, 0x40b4ddbf, 0xaa9a1dcc, 0x0fdb8fb2,
+-  0x7b2bebdb, 0xde6a79a5, 0x3444b9d6, 0x91052ba8
+-};
+-static const uint32_t table3_[256] = {
+-  0x00000000, 0xdd45aab8, 0xbf672381, 0x62228939,
+-  0x7b2231f3, 0xa6679b4b, 0xc4451272, 0x1900b8ca,
+-  0xf64463e6, 0x2b01c95e, 0x49234067, 0x9466eadf,
+-  0x8d665215, 0x5023f8ad, 0x32017194, 0xef44db2c,
+-  0xe964b13d, 0x34211b85, 0x560392bc, 0x8b463804,
+-  0x924680ce, 0x4f032a76, 0x2d21a34f, 0xf06409f7,
+-  0x1f20d2db, 0xc2657863, 0xa047f15a, 0x7d025be2,
+-  0x6402e328, 0xb9474990, 0xdb65c0a9, 0x06206a11,
+-  0xd725148b, 0x0a60be33, 0x6842370a, 0xb5079db2,
+-  0xac072578, 0x71428fc0, 0x136006f9, 0xce25ac41,
+-  0x2161776d, 0xfc24ddd5, 0x9e0654ec, 0x4343fe54,
+-  0x5a43469e, 0x8706ec26, 0xe524651f, 0x3861cfa7,
+-  0x3e41a5b6, 0xe3040f0e, 0x81268637, 0x5c632c8f,
+-  0x45639445, 0x98263efd, 0xfa04b7c4, 0x27411d7c,
+-  0xc805c650, 0x15406ce8, 0x7762e5d1, 0xaa274f69,
+-  0xb327f7a3, 0x6e625d1b, 0x0c40d422, 0xd1057e9a,
+-  0xaba65fe7, 0x76e3f55f, 0x14c17c66, 0xc984d6de,
+-  0xd0846e14, 0x0dc1c4ac, 0x6fe34d95, 0xb2a6e72d,
+-  0x5de23c01, 0x80a796b9, 0xe2851f80, 0x3fc0b538,
+-  0x26c00df2, 0xfb85a74a, 0x99a72e73, 0x44e284cb,
+-  0x42c2eeda, 0x9f874462, 0xfda5cd5b, 0x20e067e3,
+-  0x39e0df29, 0xe4a57591, 0x8687fca8, 0x5bc25610,
+-  0xb4868d3c, 0x69c32784, 0x0be1aebd, 0xd6a40405,
+-  0xcfa4bccf, 0x12e11677, 0x70c39f4e, 0xad8635f6,
+-  0x7c834b6c, 0xa1c6e1d4, 0xc3e468ed, 0x1ea1c255,
+-  0x07a17a9f, 0xdae4d027, 0xb8c6591e, 0x6583f3a6,
+-  0x8ac7288a, 0x57828232, 0x35a00b0b, 0xe8e5a1b3,
+-  0xf1e51979, 0x2ca0b3c1, 0x4e823af8, 0x93c79040,
+-  0x95e7fa51, 0x48a250e9, 0x2a80d9d0, 0xf7c57368,
+-  0xeec5cba2, 0x3380611a, 0x51a2e823, 0x8ce7429b,
+-  0x63a399b7, 0xbee6330f, 0xdcc4ba36, 0x0181108e,
+-  0x1881a844, 0xc5c402fc, 0xa7e68bc5, 0x7aa3217d,
+-  0x52a0c93f, 0x8fe56387, 0xedc7eabe, 0x30824006,
+-  0x2982f8cc, 0xf4c75274, 0x96e5db4d, 0x4ba071f5,
+-  0xa4e4aad9, 0x79a10061, 0x1b838958, 0xc6c623e0,
+-  0xdfc69b2a, 0x02833192, 0x60a1b8ab, 0xbde41213,
+-  0xbbc47802, 0x6681d2ba, 0x04a35b83, 0xd9e6f13b,
+-  0xc0e649f1, 0x1da3e349, 0x7f816a70, 0xa2c4c0c8,
+-  0x4d801be4, 0x90c5b15c, 0xf2e73865, 0x2fa292dd,
+-  0x36a22a17, 0xebe780af, 0x89c50996, 0x5480a32e,
+-  0x8585ddb4, 0x58c0770c, 0x3ae2fe35, 0xe7a7548d,
+-  0xfea7ec47, 0x23e246ff, 0x41c0cfc6, 0x9c85657e,
+-  0x73c1be52, 0xae8414ea, 0xcca69dd3, 0x11e3376b,
+-  0x08e38fa1, 0xd5a62519, 0xb784ac20, 0x6ac10698,
+-  0x6ce16c89, 0xb1a4c631, 0xd3864f08, 0x0ec3e5b0,
+-  0x17c35d7a, 0xca86f7c2, 0xa8a47efb, 0x75e1d443,
+-  0x9aa50f6f, 0x47e0a5d7, 0x25c22cee, 0xf8878656,
+-  0xe1873e9c, 0x3cc29424, 0x5ee01d1d, 0x83a5b7a5,
+-  0xf90696d8, 0x24433c60, 0x4661b559, 0x9b241fe1,
+-  0x8224a72b, 0x5f610d93, 0x3d4384aa, 0xe0062e12,
+-  0x0f42f53e, 0xd2075f86, 0xb025d6bf, 0x6d607c07,
+-  0x7460c4cd, 0xa9256e75, 0xcb07e74c, 0x16424df4,
+-  0x106227e5, 0xcd278d5d, 0xaf050464, 0x7240aedc,
+-  0x6b401616, 0xb605bcae, 0xd4273597, 0x09629f2f,
+-  0xe6264403, 0x3b63eebb, 0x59416782, 0x8404cd3a,
+-  0x9d0475f0, 0x4041df48, 0x22635671, 0xff26fcc9,
+-  0x2e238253, 0xf36628eb, 0x9144a1d2, 0x4c010b6a,
+-  0x5501b3a0, 0x88441918, 0xea669021, 0x37233a99,
+-  0xd867e1b5, 0x05224b0d, 0x6700c234, 0xba45688c,
+-  0xa345d046, 0x7e007afe, 0x1c22f3c7, 0xc167597f,
+-  0xc747336e, 0x1a0299d6, 0x782010ef, 0xa565ba57,
+-  0xbc65029d, 0x6120a825, 0x0302211c, 0xde478ba4,
+-  0x31035088, 0xec46fa30, 0x8e647309, 0x5321d9b1,
+-  0x4a21617b, 0x9764cbc3, 0xf54642fa, 0x2803e842
+-};
++namespace {
+ 
+-// Used to fetch a naturally-aligned 32-bit word in little endian byte-order
+-static inline uint32_t LE_LOAD32(const uint8_t *p) {
+-  return DecodeFixed32(reinterpret_cast<const char*>(p));
++const uint32_t kByteExtensionTable[256] = {
++    0x00000000, 0xf26b8303, 0xe13b70f7, 0x1350f3f4, 0xc79a971f, 0x35f1141c,
++    0x26a1e7e8, 0xd4ca64eb, 0x8ad958cf, 0x78b2dbcc, 0x6be22838, 0x9989ab3b,
++    0x4d43cfd0, 0xbf284cd3, 0xac78bf27, 0x5e133c24, 0x105ec76f, 0xe235446c,
++    0xf165b798, 0x030e349b, 0xd7c45070, 0x25afd373, 0x36ff2087, 0xc494a384,
++    0x9a879fa0, 0x68ec1ca3, 0x7bbcef57, 0x89d76c54, 0x5d1d08bf, 0xaf768bbc,
++    0xbc267848, 0x4e4dfb4b, 0x20bd8ede, 0xd2d60ddd, 0xc186fe29, 0x33ed7d2a,
++    0xe72719c1, 0x154c9ac2, 0x061c6936, 0xf477ea35, 0xaa64d611, 0x580f5512,
++    0x4b5fa6e6, 0xb93425e5, 0x6dfe410e, 0x9f95c20d, 0x8cc531f9, 0x7eaeb2fa,
++    0x30e349b1, 0xc288cab2, 0xd1d83946, 0x23b3ba45, 0xf779deae, 0x05125dad,
++    0x1642ae59, 0xe4292d5a, 0xba3a117e, 0x4851927d, 0x5b016189, 0xa96ae28a,
++    0x7da08661, 0x8fcb0562, 0x9c9bf696, 0x6ef07595, 0x417b1dbc, 0xb3109ebf,
++    0xa0406d4b, 0x522bee48, 0x86e18aa3, 0x748a09a0, 0x67dafa54, 0x95b17957,
++    0xcba24573, 0x39c9c670, 0x2a993584, 0xd8f2b687, 0x0c38d26c, 0xfe53516f,
++    0xed03a29b, 0x1f682198, 0x5125dad3, 0xa34e59d0, 0xb01eaa24, 0x42752927,
++    0x96bf4dcc, 0x64d4cecf, 0x77843d3b, 0x85efbe38, 0xdbfc821c, 0x2997011f,
++    0x3ac7f2eb, 0xc8ac71e8, 0x1c661503, 0xee0d9600, 0xfd5d65f4, 0x0f36e6f7,
++    0x61c69362, 0x93ad1061, 0x80fde395, 0x72966096, 0xa65c047d, 0x5437877e,
++    0x4767748a, 0xb50cf789, 0xeb1fcbad, 0x197448ae, 0x0a24bb5a, 0xf84f3859,
++    0x2c855cb2, 0xdeeedfb1, 0xcdbe2c45, 0x3fd5af46, 0x7198540d, 0x83f3d70e,
++    0x90a324fa, 0x62c8a7f9, 0xb602c312, 0x44694011, 0x5739b3e5, 0xa55230e6,
++    0xfb410cc2, 0x092a8fc1, 0x1a7a7c35, 0xe811ff36, 0x3cdb9bdd, 0xceb018de,
++    0xdde0eb2a, 0x2f8b6829, 0x82f63b78, 0x709db87b, 0x63cd4b8f, 0x91a6c88c,
++    0x456cac67, 0xb7072f64, 0xa457dc90, 0x563c5f93, 0x082f63b7, 0xfa44e0b4,
++    0xe9141340, 0x1b7f9043, 0xcfb5f4a8, 0x3dde77ab, 0x2e8e845f, 0xdce5075c,
++    0x92a8fc17, 0x60c37f14, 0x73938ce0, 0x81f80fe3, 0x55326b08, 0xa759e80b,
++    0xb4091bff, 0x466298fc, 0x1871a4d8, 0xea1a27db, 0xf94ad42f, 0x0b21572c,
++    0xdfeb33c7, 0x2d80b0c4, 0x3ed04330, 0xccbbc033, 0xa24bb5a6, 0x502036a5,
++    0x4370c551, 0xb11b4652, 0x65d122b9, 0x97baa1ba, 0x84ea524e, 0x7681d14d,
++    0x2892ed69, 0xdaf96e6a, 0xc9a99d9e, 0x3bc21e9d, 0xef087a76, 0x1d63f975,
++    0x0e330a81, 0xfc588982, 0xb21572c9, 0x407ef1ca, 0x532e023e, 0xa145813d,
++    0x758fe5d6, 0x87e466d5, 0x94b49521, 0x66df1622, 0x38cc2a06, 0xcaa7a905,
++    0xd9f75af1, 0x2b9cd9f2, 0xff56bd19, 0x0d3d3e1a, 0x1e6dcdee, 0xec064eed,
++    0xc38d26c4, 0x31e6a5c7, 0x22b65633, 0xd0ddd530, 0x0417b1db, 0xf67c32d8,
++    0xe52cc12c, 0x1747422f, 0x49547e0b, 0xbb3ffd08, 0xa86f0efc, 0x5a048dff,
++    0x8ecee914, 0x7ca56a17, 0x6ff599e3, 0x9d9e1ae0, 0xd3d3e1ab, 0x21b862a8,
++    0x32e8915c, 0xc083125f, 0x144976b4, 0xe622f5b7, 0xf5720643, 0x07198540,
++    0x590ab964, 0xab613a67, 0xb831c993, 0x4a5a4a90, 0x9e902e7b, 0x6cfbad78,
++    0x7fab5e8c, 0x8dc0dd8f, 0xe330a81a, 0x115b2b19, 0x020bd8ed, 0xf0605bee,
++    0x24aa3f05, 0xd6c1bc06, 0xc5914ff2, 0x37faccf1, 0x69e9f0d5, 0x9b8273d6,
++    0x88d28022, 0x7ab90321, 0xae7367ca, 0x5c18e4c9, 0x4f48173d, 0xbd23943e,
++    0xf36e6f75, 0x0105ec76, 0x12551f82, 0xe03e9c81, 0x34f4f86a, 0xc69f7b69,
++    0xd5cf889d, 0x27a40b9e, 0x79b737ba, 0x8bdcb4b9, 0x988c474d, 0x6ae7c44e,
++    0xbe2da0a5, 0x4c4623a6, 0x5f16d052, 0xad7d5351};
++
++const uint32_t kStrideExtensionTable0[256] = {
++    0x00000000, 0x30d23865, 0x61a470ca, 0x517648af, 0xc348e194, 0xf39ad9f1,
++    0xa2ec915e, 0x923ea93b, 0x837db5d9, 0xb3af8dbc, 0xe2d9c513, 0xd20bfd76,
++    0x4035544d, 0x70e76c28, 0x21912487, 0x11431ce2, 0x03171d43, 0x33c52526,
++    0x62b36d89, 0x526155ec, 0xc05ffcd7, 0xf08dc4b2, 0xa1fb8c1d, 0x9129b478,
++    0x806aa89a, 0xb0b890ff, 0xe1ced850, 0xd11ce035, 0x4322490e, 0x73f0716b,
++    0x228639c4, 0x125401a1, 0x062e3a86, 0x36fc02e3, 0x678a4a4c, 0x57587229,
++    0xc566db12, 0xf5b4e377, 0xa4c2abd8, 0x941093bd, 0x85538f5f, 0xb581b73a,
++    0xe4f7ff95, 0xd425c7f0, 0x461b6ecb, 0x76c956ae, 0x27bf1e01, 0x176d2664,
++    0x053927c5, 0x35eb1fa0, 0x649d570f, 0x544f6f6a, 0xc671c651, 0xf6a3fe34,
++    0xa7d5b69b, 0x97078efe, 0x8644921c, 0xb696aa79, 0xe7e0e2d6, 0xd732dab3,
++    0x450c7388, 0x75de4bed, 0x24a80342, 0x147a3b27, 0x0c5c750c, 0x3c8e4d69,
++    0x6df805c6, 0x5d2a3da3, 0xcf149498, 0xffc6acfd, 0xaeb0e452, 0x9e62dc37,
++    0x8f21c0d5, 0xbff3f8b0, 0xee85b01f, 0xde57887a, 0x4c692141, 0x7cbb1924,
++    0x2dcd518b, 0x1d1f69ee, 0x0f4b684f, 0x3f99502a, 0x6eef1885, 0x5e3d20e0,
++    0xcc0389db, 0xfcd1b1be, 0xada7f911, 0x9d75c174, 0x8c36dd96, 0xbce4e5f3,
++    0xed92ad5c, 0xdd409539, 0x4f7e3c02, 0x7fac0467, 0x2eda4cc8, 0x1e0874ad,
++    0x0a724f8a, 0x3aa077ef, 0x6bd63f40, 0x5b040725, 0xc93aae1e, 0xf9e8967b,
++    0xa89eded4, 0x984ce6b1, 0x890ffa53, 0xb9ddc236, 0xe8ab8a99, 0xd879b2fc,
++    0x4a471bc7, 0x7a9523a2, 0x2be36b0d, 0x1b315368, 0x096552c9, 0x39b76aac,
++    0x68c12203, 0x58131a66, 0xca2db35d, 0xfaff8b38, 0xab89c397, 0x9b5bfbf2,
++    0x8a18e710, 0xbacadf75, 0xebbc97da, 0xdb6eafbf, 0x49500684, 0x79823ee1,
++    0x28f4764e, 0x18264e2b, 0x18b8ea18, 0x286ad27d, 0x791c9ad2, 0x49cea2b7,
++    0xdbf00b8c, 0xeb2233e9, 0xba547b46, 0x8a864323, 0x9bc55fc1, 0xab1767a4,
++    0xfa612f0b, 0xcab3176e, 0x588dbe55, 0x685f8630, 0x3929ce9f, 0x09fbf6fa,
++    0x1baff75b, 0x2b7dcf3e, 0x7a0b8791, 0x4ad9bff4, 0xd8e716cf, 0xe8352eaa,
++    0xb9436605, 0x89915e60, 0x98d24282, 0xa8007ae7, 0xf9763248, 0xc9a40a2d,
++    0x5b9aa316, 0x6b489b73, 0x3a3ed3dc, 0x0aecebb9, 0x1e96d09e, 0x2e44e8fb,
++    0x7f32a054, 0x4fe09831, 0xddde310a, 0xed0c096f, 0xbc7a41c0, 0x8ca879a5,
++    0x9deb6547, 0xad395d22, 0xfc4f158d, 0xcc9d2de8, 0x5ea384d3, 0x6e71bcb6,
++    0x3f07f419, 0x0fd5cc7c, 0x1d81cddd, 0x2d53f5b8, 0x7c25bd17, 0x4cf78572,
++    0xdec92c49, 0xee1b142c, 0xbf6d5c83, 0x8fbf64e6, 0x9efc7804, 0xae2e4061,
++    0xff5808ce, 0xcf8a30ab, 0x5db49990, 0x6d66a1f5, 0x3c10e95a, 0x0cc2d13f,
++    0x14e49f14, 0x2436a771, 0x7540efde, 0x4592d7bb, 0xd7ac7e80, 0xe77e46e5,
++    0xb6080e4a, 0x86da362f, 0x97992acd, 0xa74b12a8, 0xf63d5a07, 0xc6ef6262,
++    0x54d1cb59, 0x6403f33c, 0x3575bb93, 0x05a783f6, 0x17f38257, 0x2721ba32,
++    0x7657f29d, 0x4685caf8, 0xd4bb63c3, 0xe4695ba6, 0xb51f1309, 0x85cd2b6c,
++    0x948e378e, 0xa45c0feb, 0xf52a4744, 0xc5f87f21, 0x57c6d61a, 0x6714ee7f,
++    0x3662a6d0, 0x06b09eb5, 0x12caa592, 0x22189df7, 0x736ed558, 0x43bced3d,
++    0xd1824406, 0xe1507c63, 0xb02634cc, 0x80f40ca9, 0x91b7104b, 0xa165282e,
++    0xf0136081, 0xc0c158e4, 0x52fff1df, 0x622dc9ba, 0x335b8115, 0x0389b970,
++    0x11ddb8d1, 0x210f80b4, 0x7079c81b, 0x40abf07e, 0xd2955945, 0xe2476120,
++    0xb331298f, 0x83e311ea, 0x92a00d08, 0xa272356d, 0xf3047dc2, 0xc3d645a7,
++    0x51e8ec9c, 0x613ad4f9, 0x304c9c56, 0x009ea433};
++
++const uint32_t kStrideExtensionTable1[256] = {
++    0x00000000, 0x54075546, 0xa80eaa8c, 0xfc09ffca, 0x55f123e9, 0x01f676af,
++    0xfdff8965, 0xa9f8dc23, 0xabe247d2, 0xffe51294, 0x03eced5e, 0x57ebb818,
++    0xfe13643b, 0xaa14317d, 0x561dceb7, 0x021a9bf1, 0x5228f955, 0x062fac13,
++    0xfa2653d9, 0xae21069f, 0x07d9dabc, 0x53de8ffa, 0xafd77030, 0xfbd02576,
++    0xf9cabe87, 0xadcdebc1, 0x51c4140b, 0x05c3414d, 0xac3b9d6e, 0xf83cc828,
++    0x043537e2, 0x503262a4, 0xa451f2aa, 0xf056a7ec, 0x0c5f5826, 0x58580d60,
++    0xf1a0d143, 0xa5a78405, 0x59ae7bcf, 0x0da92e89, 0x0fb3b578, 0x5bb4e03e,
++    0xa7bd1ff4, 0xf3ba4ab2, 0x5a429691, 0x0e45c3d7, 0xf24c3c1d, 0xa64b695b,
++    0xf6790bff, 0xa27e5eb9, 0x5e77a173, 0x0a70f435, 0xa3882816, 0xf78f7d50,
++    0x0b86829a, 0x5f81d7dc, 0x5d9b4c2d, 0x099c196b, 0xf595e6a1, 0xa192b3e7,
++    0x086a6fc4, 0x5c6d3a82, 0xa064c548, 0xf463900e, 0x4d4f93a5, 0x1948c6e3,
++    0xe5413929, 0xb1466c6f, 0x18beb04c, 0x4cb9e50a, 0xb0b01ac0, 0xe4b74f86,
++    0xe6add477, 0xb2aa8131, 0x4ea37efb, 0x1aa42bbd, 0xb35cf79e, 0xe75ba2d8,
++    0x1b525d12, 0x4f550854, 0x1f676af0, 0x4b603fb6, 0xb769c07c, 0xe36e953a,
++    0x4a964919, 0x1e911c5f, 0xe298e395, 0xb69fb6d3, 0xb4852d22, 0xe0827864,
++    0x1c8b87ae, 0x488cd2e8, 0xe1740ecb, 0xb5735b8d, 0x497aa447, 0x1d7df101,
++    0xe91e610f, 0xbd193449, 0x4110cb83, 0x15179ec5, 0xbcef42e6, 0xe8e817a0,
++    0x14e1e86a, 0x40e6bd2c, 0x42fc26dd, 0x16fb739b, 0xeaf28c51, 0xbef5d917,
++    0x170d0534, 0x430a5072, 0xbf03afb8, 0xeb04fafe, 0xbb36985a, 0xef31cd1c,
++    0x133832d6, 0x473f6790, 0xeec7bbb3, 0xbac0eef5, 0x46c9113f, 0x12ce4479,
++    0x10d4df88, 0x44d38ace, 0xb8da7504, 0xecdd2042, 0x4525fc61, 0x1122a927,
++    0xed2b56ed, 0xb92c03ab, 0x9a9f274a, 0xce98720c, 0x32918dc6, 0x6696d880,
++    0xcf6e04a3, 0x9b6951e5, 0x6760ae2f, 0x3367fb69, 0x317d6098, 0x657a35de,
++    0x9973ca14, 0xcd749f52, 0x648c4371, 0x308b1637, 0xcc82e9fd, 0x9885bcbb,
++    0xc8b7de1f, 0x9cb08b59, 0x60b97493, 0x34be21d5, 0x9d46fdf6, 0xc941a8b0,
++    0x3548577a, 0x614f023c, 0x635599cd, 0x3752cc8b, 0xcb5b3341, 0x9f5c6607,
++    0x36a4ba24, 0x62a3ef62, 0x9eaa10a8, 0xcaad45ee, 0x3eced5e0, 0x6ac980a6,
++    0x96c07f6c, 0xc2c72a2a, 0x6b3ff609, 0x3f38a34f, 0xc3315c85, 0x973609c3,
++    0x952c9232, 0xc12bc774, 0x3d2238be, 0x69256df8, 0xc0ddb1db, 0x94dae49d,
++    0x68d31b57, 0x3cd44e11, 0x6ce62cb5, 0x38e179f3, 0xc4e88639, 0x90efd37f,
++    0x39170f5c, 0x6d105a1a, 0x9119a5d0, 0xc51ef096, 0xc7046b67, 0x93033e21,
++    0x6f0ac1eb, 0x3b0d94ad, 0x92f5488e, 0xc6f21dc8, 0x3afbe202, 0x6efcb744,
++    0xd7d0b4ef, 0x83d7e1a9, 0x7fde1e63, 0x2bd94b25, 0x82219706, 0xd626c240,
++    0x2a2f3d8a, 0x7e2868cc, 0x7c32f33d, 0x2835a67b, 0xd43c59b1, 0x803b0cf7,
++    0x29c3d0d4, 0x7dc48592, 0x81cd7a58, 0xd5ca2f1e, 0x85f84dba, 0xd1ff18fc,
++    0x2df6e736, 0x79f1b270, 0xd0096e53, 0x840e3b15, 0x7807c4df, 0x2c009199,
++    0x2e1a0a68, 0x7a1d5f2e, 0x8614a0e4, 0xd213f5a2, 0x7beb2981, 0x2fec7cc7,
++    0xd3e5830d, 0x87e2d64b, 0x73814645, 0x27861303, 0xdb8fecc9, 0x8f88b98f,
++    0x267065ac, 0x727730ea, 0x8e7ecf20, 0xda799a66, 0xd8630197, 0x8c6454d1,
++    0x706dab1b, 0x246afe5d, 0x8d92227e, 0xd9957738, 0x259c88f2, 0x719bddb4,
++    0x21a9bf10, 0x75aeea56, 0x89a7159c, 0xdda040da, 0x74589cf9, 0x205fc9bf,
++    0xdc563675, 0x88516333, 0x8a4bf8c2, 0xde4cad84, 0x2245524e, 0x76420708,
++    0xdfbadb2b, 0x8bbd8e6d, 0x77b471a7, 0x23b324e1};
++
++const uint32_t kStrideExtensionTable2[256] = {
++    0x00000000, 0x678efd01, 0xcf1dfa02, 0xa8930703, 0x9bd782f5, 0xfc597ff4,
++    0x54ca78f7, 0x334485f6, 0x3243731b, 0x55cd8e1a, 0xfd5e8919, 0x9ad07418,
++    0xa994f1ee, 0xce1a0cef, 0x66890bec, 0x0107f6ed, 0x6486e636, 0x03081b37,
++    0xab9b1c34, 0xcc15e135, 0xff5164c3, 0x98df99c2, 0x304c9ec1, 0x57c263c0,
++    0x56c5952d, 0x314b682c, 0x99d86f2f, 0xfe56922e, 0xcd1217d8, 0xaa9cead9,
++    0x020fedda, 0x658110db, 0xc90dcc6c, 0xae83316d, 0x0610366e, 0x619ecb6f,
++    0x52da4e99, 0x3554b398, 0x9dc7b49b, 0xfa49499a, 0xfb4ebf77, 0x9cc04276,
++    0x34534575, 0x53ddb874, 0x60993d82, 0x0717c083, 0xaf84c780, 0xc80a3a81,
++    0xad8b2a5a, 0xca05d75b, 0x6296d058, 0x05182d59, 0x365ca8af, 0x51d255ae,
++    0xf94152ad, 0x9ecfafac, 0x9fc85941, 0xf846a440, 0x50d5a343, 0x375b5e42,
++    0x041fdbb4, 0x639126b5, 0xcb0221b6, 0xac8cdcb7, 0x97f7ee29, 0xf0791328,
++    0x58ea142b, 0x3f64e92a, 0x0c206cdc, 0x6bae91dd, 0xc33d96de, 0xa4b36bdf,
++    0xa5b49d32, 0xc23a6033, 0x6aa96730, 0x0d279a31, 0x3e631fc7, 0x59ede2c6,
++    0xf17ee5c5, 0x96f018c4, 0xf371081f, 0x94fff51e, 0x3c6cf21d, 0x5be20f1c,
++    0x68a68aea, 0x0f2877eb, 0xa7bb70e8, 0xc0358de9, 0xc1327b04, 0xa6bc8605,
++    0x0e2f8106, 0x69a17c07, 0x5ae5f9f1, 0x3d6b04f0, 0x95f803f3, 0xf276fef2,
++    0x5efa2245, 0x3974df44, 0x91e7d847, 0xf6692546, 0xc52da0b0, 0xa2a35db1,
++    0x0a305ab2, 0x6dbea7b3, 0x6cb9515e, 0x0b37ac5f, 0xa3a4ab5c, 0xc42a565d,
++    0xf76ed3ab, 0x90e02eaa, 0x387329a9, 0x5ffdd4a8, 0x3a7cc473, 0x5df23972,
++    0xf5613e71, 0x92efc370, 0xa1ab4686, 0xc625bb87, 0x6eb6bc84, 0x09384185,
++    0x083fb768, 0x6fb14a69, 0xc7224d6a, 0xa0acb06b, 0x93e8359d, 0xf466c89c,
++    0x5cf5cf9f, 0x3b7b329e, 0x2a03aaa3, 0x4d8d57a2, 0xe51e50a1, 0x8290ada0,
++    0xb1d42856, 0xd65ad557, 0x7ec9d254, 0x19472f55, 0x1840d9b8, 0x7fce24b9,
++    0xd75d23ba, 0xb0d3debb, 0x83975b4d, 0xe419a64c, 0x4c8aa14f, 0x2b045c4e,
++    0x4e854c95, 0x290bb194, 0x8198b697, 0xe6164b96, 0xd552ce60, 0xb2dc3361,
++    0x1a4f3462, 0x7dc1c963, 0x7cc63f8e, 0x1b48c28f, 0xb3dbc58c, 0xd455388d,
++    0xe711bd7b, 0x809f407a, 0x280c4779, 0x4f82ba78, 0xe30e66cf, 0x84809bce,
++    0x2c139ccd, 0x4b9d61cc, 0x78d9e43a, 0x1f57193b, 0xb7c41e38, 0xd04ae339,
++    0xd14d15d4, 0xb6c3e8d5, 0x1e50efd6, 0x79de12d7, 0x4a9a9721, 0x2d146a20,
++    0x85876d23, 0xe2099022, 0x878880f9, 0xe0067df8, 0x48957afb, 0x2f1b87fa,
++    0x1c5f020c, 0x7bd1ff0d, 0xd342f80e, 0xb4cc050f, 0xb5cbf3e2, 0xd2450ee3,
++    0x7ad609e0, 0x1d58f4e1, 0x2e1c7117, 0x49928c16, 0xe1018b15, 0x868f7614,
++    0xbdf4448a, 0xda7ab98b, 0x72e9be88, 0x15674389, 0x2623c67f, 0x41ad3b7e,
++    0xe93e3c7d, 0x8eb0c17c, 0x8fb73791, 0xe839ca90, 0x40aacd93, 0x27243092,
++    0x1460b564, 0x73ee4865, 0xdb7d4f66, 0xbcf3b267, 0xd972a2bc, 0xbefc5fbd,
++    0x166f58be, 0x71e1a5bf, 0x42a52049, 0x252bdd48, 0x8db8da4b, 0xea36274a,
++    0xeb31d1a7, 0x8cbf2ca6, 0x242c2ba5, 0x43a2d6a4, 0x70e65352, 0x1768ae53,
++    0xbffba950, 0xd8755451, 0x74f988e6, 0x137775e7, 0xbbe472e4, 0xdc6a8fe5,
++    0xef2e0a13, 0x88a0f712, 0x2033f011, 0x47bd0d10, 0x46bafbfd, 0x213406fc,
++    0x89a701ff, 0xee29fcfe, 0xdd6d7908, 0xbae38409, 0x1270830a, 0x75fe7e0b,
++    0x107f6ed0, 0x77f193d1, 0xdf6294d2, 0xb8ec69d3, 0x8ba8ec25, 0xec261124,
++    0x44b51627, 0x233beb26, 0x223c1dcb, 0x45b2e0ca, 0xed21e7c9, 0x8aaf1ac8,
++    0xb9eb9f3e, 0xde65623f, 0x76f6653c, 0x1178983d};
++
++const uint32_t kStrideExtensionTable3[256] = {
++    0x00000000, 0xf20c0dfe, 0xe1f46d0d, 0x13f860f3, 0xc604aceb, 0x3408a115,
++    0x27f0c1e6, 0xd5fccc18, 0x89e52f27, 0x7be922d9, 0x6811422a, 0x9a1d4fd4,
++    0x4fe183cc, 0xbded8e32, 0xae15eec1, 0x5c19e33f, 0x162628bf, 0xe42a2541,
++    0xf7d245b2, 0x05de484c, 0xd0228454, 0x222e89aa, 0x31d6e959, 0xc3dae4a7,
++    0x9fc30798, 0x6dcf0a66, 0x7e376a95, 0x8c3b676b, 0x59c7ab73, 0xabcba68d,
++    0xb833c67e, 0x4a3fcb80, 0x2c4c517e, 0xde405c80, 0xcdb83c73, 0x3fb4318d,
++    0xea48fd95, 0x1844f06b, 0x0bbc9098, 0xf9b09d66, 0xa5a97e59, 0x57a573a7,
++    0x445d1354, 0xb6511eaa, 0x63add2b2, 0x91a1df4c, 0x8259bfbf, 0x7055b241,
++    0x3a6a79c1, 0xc866743f, 0xdb9e14cc, 0x29921932, 0xfc6ed52a, 0x0e62d8d4,
++    0x1d9ab827, 0xef96b5d9, 0xb38f56e6, 0x41835b18, 0x527b3beb, 0xa0773615,
++    0x758bfa0d, 0x8787f7f3, 0x947f9700, 0x66739afe, 0x5898a2fc, 0xaa94af02,
++    0xb96ccff1, 0x4b60c20f, 0x9e9c0e17, 0x6c9003e9, 0x7f68631a, 0x8d646ee4,
++    0xd17d8ddb, 0x23718025, 0x3089e0d6, 0xc285ed28, 0x17792130, 0xe5752cce,
++    0xf68d4c3d, 0x048141c3, 0x4ebe8a43, 0xbcb287bd, 0xaf4ae74e, 0x5d46eab0,
++    0x88ba26a8, 0x7ab62b56, 0x694e4ba5, 0x9b42465b, 0xc75ba564, 0x3557a89a,
++    0x26afc869, 0xd4a3c597, 0x015f098f, 0xf3530471, 0xe0ab6482, 0x12a7697c,
++    0x74d4f382, 0x86d8fe7c, 0x95209e8f, 0x672c9371, 0xb2d05f69, 0x40dc5297,
++    0x53243264, 0xa1283f9a, 0xfd31dca5, 0x0f3dd15b, 0x1cc5b1a8, 0xeec9bc56,
++    0x3b35704e, 0xc9397db0, 0xdac11d43, 0x28cd10bd, 0x62f2db3d, 0x90fed6c3,
++    0x8306b630, 0x710abbce, 0xa4f677d6, 0x56fa7a28, 0x45021adb, 0xb70e1725,
++    0xeb17f41a, 0x191bf9e4, 0x0ae39917, 0xf8ef94e9, 0x2d1358f1, 0xdf1f550f,
++    0xcce735fc, 0x3eeb3802, 0xb13145f8, 0x433d4806, 0x50c528f5, 0xa2c9250b,
++    0x7735e913, 0x8539e4ed, 0x96c1841e, 0x64cd89e0, 0x38d46adf, 0xcad86721,
++    0xd92007d2, 0x2b2c0a2c, 0xfed0c634, 0x0cdccbca, 0x1f24ab39, 0xed28a6c7,
++    0xa7176d47, 0x551b60b9, 0x46e3004a, 0xb4ef0db4, 0x6113c1ac, 0x931fcc52,
++    0x80e7aca1, 0x72eba15f, 0x2ef24260, 0xdcfe4f9e, 0xcf062f6d, 0x3d0a2293,
++    0xe8f6ee8b, 0x1afae375, 0x09028386, 0xfb0e8e78, 0x9d7d1486, 0x6f711978,
++    0x7c89798b, 0x8e857475, 0x5b79b86d, 0xa975b593, 0xba8dd560, 0x4881d89e,
++    0x14983ba1, 0xe694365f, 0xf56c56ac, 0x07605b52, 0xd29c974a, 0x20909ab4,
++    0x3368fa47, 0xc164f7b9, 0x8b5b3c39, 0x795731c7, 0x6aaf5134, 0x98a35cca,
++    0x4d5f90d2, 0xbf539d2c, 0xacabfddf, 0x5ea7f021, 0x02be131e, 0xf0b21ee0,
++    0xe34a7e13, 0x114673ed, 0xc4babff5, 0x36b6b20b, 0x254ed2f8, 0xd742df06,
++    0xe9a9e704, 0x1ba5eafa, 0x085d8a09, 0xfa5187f7, 0x2fad4bef, 0xdda14611,
++    0xce5926e2, 0x3c552b1c, 0x604cc823, 0x9240c5dd, 0x81b8a52e, 0x73b4a8d0,
++    0xa64864c8, 0x54446936, 0x47bc09c5, 0xb5b0043b, 0xff8fcfbb, 0x0d83c245,
++    0x1e7ba2b6, 0xec77af48, 0x398b6350, 0xcb876eae, 0xd87f0e5d, 0x2a7303a3,
++    0x766ae09c, 0x8466ed62, 0x979e8d91, 0x6592806f, 0xb06e4c77, 0x42624189,
++    0x519a217a, 0xa3962c84, 0xc5e5b67a, 0x37e9bb84, 0x2411db77, 0xd61dd689,
++    0x03e11a91, 0xf1ed176f, 0xe215779c, 0x10197a62, 0x4c00995d, 0xbe0c94a3,
++    0xadf4f450, 0x5ff8f9ae, 0x8a0435b6, 0x78083848, 0x6bf058bb, 0x99fc5545,
++    0xd3c39ec5, 0x21cf933b, 0x3237f3c8, 0xc03bfe36, 0x15c7322e, 0xe7cb3fd0,
++    0xf4335f23, 0x063f52dd, 0x5a26b1e2, 0xa82abc1c, 0xbbd2dcef, 0x49ded111,
++    0x9c221d09, 0x6e2e10f7, 0x7dd67004, 0x8fda7dfa};
++
++// CRCs are pre- and post- conditioned by xoring with all ones.
++static constexpr const uint32_t kCRC32Xor = static_cast<uint32_t>(0xffffffffU);
++
++// Reads a little-endian 32-bit integer from a 32-bit-aligned buffer.
++inline uint32_t ReadUint32LE(const uint8_t* buffer) {
++  return DecodeFixed32(reinterpret_cast<const char*>(buffer));
+ }
+ 
++// Returns the smallest address >= the given address that is aligned to N bytes.
++//
++// N must be a power of two.
++template <int N>
++constexpr inline const uint8_t* RoundUp(const uint8_t* pointer) {
++  return reinterpret_cast<uint8_t*>(
++      (reinterpret_cast<uintptr_t>(pointer) + (N - 1))
++      & ~static_cast<uintptr_t>(N - 1));
++}
++
++}  // namespace
++
+ // Determine if the CPU running this program can accelerate the CRC32C
+ // calculation.
+ static bool CanAccelerateCRC32C() {
+@@ -302,48 +279,101 @@ uint32_t Extend(uint32_t crc, const char* buf, size_t size) {
+     return port::AcceleratedCRC32C(crc, buf, size);
+   }
+ 
+-  const uint8_t *p = reinterpret_cast<const uint8_t *>(buf);
+-  const uint8_t *e = p + size;
+-  uint32_t l = crc ^ 0xffffffffu;
++  const uint8_t* p = reinterpret_cast<const uint8_t*>(buf);
++  const uint8_t* e = p + size;
++  uint32_t l = crc ^ kCRC32Xor;
++
++// Process one byte at a time.
++#define STEP1                              \
++  do {                                     \
++    int c = (l & 0xff) ^ *p++;             \
++    l = kByteExtensionTable[c] ^ (l >> 8); \
++  } while (0)
+ 
+-#define STEP1 do {                              \
+-    int c = (l & 0xff) ^ *p++;                  \
+-    l = table0_[c] ^ (l >> 8);                  \
+-} while (0)
+-#define STEP4 do {                              \
+-    uint32_t c = l ^ LE_LOAD32(p);              \
+-    p += 4;                                     \
+-    l = table3_[c & 0xff] ^                     \
+-        table2_[(c >> 8) & 0xff] ^              \
+-        table1_[(c >> 16) & 0xff] ^             \
+-        table0_[c >> 24];                       \
+-} while (0)
++// Process one of the 4 strides of 4-byte data.
++#define STEP4(s)                                                               \
++  do {                                                                         \
++    crc##s = ReadUint32LE(p + s * 4) ^ kStrideExtensionTable3[crc##s & 0xff] ^ \
++             kStrideExtensionTable2[(crc##s >> 8) & 0xff] ^                    \
++             kStrideExtensionTable1[(crc##s >> 16) & 0xff] ^                   \
++             kStrideExtensionTable0[crc##s >> 24];                             \
++  } while (0)
+ 
+-  // Point x at first 4-byte aligned byte in string.  This might be
+-  // just past the end of the string.
+-  const uintptr_t pval = reinterpret_cast<uintptr_t>(p);
+-  const uint8_t* x = reinterpret_cast<const uint8_t*>(((pval + 3) >> 2) << 2);
++// Process a 16-byte swath of 4 strides, each of which has 4 bytes of data.
++#define STEP16 \
++  do {         \
++    STEP4(0);  \
++    STEP4(1);  \
++    STEP4(2);  \
++    STEP4(3);  \
++    p += 16;   \
++  } while (0)
++
++// Process 4 bytes that were already loaded into a word.
++#define STEP4W(w)                                   \
++  do {                                              \
++    w ^= l;                                         \
++    for (size_t i = 0; i < 4; ++i) {                \
++      w = (w >> 8) ^ kByteExtensionTable[w & 0xff]; \
++    }                                               \
++    l = w;                                          \
++  } while (0)
++
++  // Point x at first 4-byte aligned byte in the buffer. This might be past the
++  // end of the buffer.
++  const uint8_t* x = RoundUp<4>(p);
+   if (x <= e) {
+-    // Process bytes until finished or p is 4-byte aligned
++    // Process bytes p is 4-byte aligned.
+     while (p != x) {
+       STEP1;
+     }
+   }
+-  // Process bytes 16 at a time
+-  while ((e-p) >= 16) {
+-    STEP4; STEP4; STEP4; STEP4;
+-  }
+-  // Process bytes 4 at a time
+-  while ((e-p) >= 4) {
+-    STEP4;
++
++  if ((e - p) >= 16) {
++    // Load a 16-byte swath into the stride partial results.
++    uint32_t crc0 = ReadUint32LE(p + 0 * 4) ^ l;
++    uint32_t crc1 = ReadUint32LE(p + 1 * 4);
++    uint32_t crc2 = ReadUint32LE(p + 2 * 4);
++    uint32_t crc3 = ReadUint32LE(p + 3 * 4);
++    p += 16;
++
++    // It is possible to get better speeds (at least on x86) by interleaving
++    // prefetching 256 bytes ahead with processing 64 bytes at a time. See the
++    // portable implementation in https://github.com/google/crc32c/.
++
++    // Process one 16-byte swath at a time.
++    while ((e - p) >= 16) {
++      STEP16;
++    }
++
++    // Advance one word at a time as far as possible.
++    while ((e - p) >= 4) {
++      STEP4(0);
++      uint32_t tmp = crc0;
++      crc0 = crc1;
++      crc1 = crc2;
++      crc2 = crc3;
++      crc3 = tmp;
++      p += 4;
++    }
++
++    // Combine the 4 partial stride results.
++    l = 0;
++    STEP4W(crc0);
++    STEP4W(crc1);
++    STEP4W(crc2);
++    STEP4W(crc3);
+   }
+-  // Process the last few bytes
++
++  // Process the last few bytes.
+   while (p != e) {
+     STEP1;
+   }
++#undef STEP4W
++#undef STEP16
+ #undef STEP4
+ #undef STEP1
+-  return l ^ 0xffffffffu;
++  return l ^ kCRC32Xor;
+ }
+ 
+ }  // namespace crc32c
+
+From 7e12c00ecf1bb725e212618e7026e4d34d6cd3bb Mon Sep 17 00:00:00 2001
+From: sanjay <sanjay@google.com>
+Date: Mon, 2 Oct 2017 12:37:45 -0700
+Subject: [PATCH 10/26] Fix issue 474: a race between the f*_unlocked() STDIO
+ calls in env_posix.cc and concurrent application calls to fflush(NULL).
+
+The fix is to avoid using stdio in env_posix.cc but add our own
+buffering where we need it.
+
+Added a test to reproduce the bug.
+
+Added a test for Env reads/writes.
+
+-------------
+Created by MOE: https://github.com/google/moe
+MOE_MIGRATED_REVID=170738066
+---
+ db/db_test.cc     |  23 +++++++---
+ util/env_posix.cc | 130 +++++++++++++++++++++++++++++++++++++-----------------
+ util/env_test.cc  |  50 +++++++++++++++++++++
+ 3 files changed, 156 insertions(+), 47 deletions(-)
+
+diff --git a/deps/leveldb/leveldb-1.20/db/db_test.cc b/deps/leveldb/leveldb-1.20/db/db_test.cc
+index a0b08bc19..edc3916e8 100644
+--- a/deps/leveldb/leveldb-1.20/db/db_test.cc
++++ b/deps/leveldb/leveldb-1.20/db/db_test.cc
+@@ -25,6 +25,13 @@ static std::string RandomString(Random* rnd, int len) {
+   return r;
+ }
+ 
++static std::string RandomKey(Random* rnd) {
++  int len = (rnd->OneIn(3)
++             ? 1                // Short sometimes to encourage collisions
++             : (rnd->OneIn(100) ? rnd->Skewed(10) : rnd->Uniform(10)));
++  return test::RandomKey(rnd, len);
++}
++
+ namespace {
+ class AtomicCounter {
+  private:
+@@ -1394,6 +1401,15 @@ TEST(DBTest, L0_CompactionBug_Issue44_b) {
+   ASSERT_EQ("(->)(c->cv)", Contents());
+ }
+ 
++TEST(DBTest, Fflush_Issue474) {
++  static const int kNum = 100000;
++  Random rnd(test::RandomSeed());
++  for (int i = 0; i < kNum; i++) {
++    fflush(NULL);
++    ASSERT_OK(Put(RandomKey(&rnd), RandomString(&rnd, 100)));
++  }
++}
++
+ TEST(DBTest, ComparatorCheck) {
+   class NewComparator : public Comparator {
+    public:
+@@ -1959,13 +1975,6 @@ class ModelDB: public DB {
+   KVMap map_;
+ };
+ 
+-static std::string RandomKey(Random* rnd) {
+-  int len = (rnd->OneIn(3)
+-             ? 1                // Short sometimes to encourage collisions
+-             : (rnd->OneIn(100) ? rnd->Skewed(10) : rnd->Uniform(10)));
+-  return test::RandomKey(rnd, len);
+-}
+-
+ static bool CompareIterators(int step,
+                              DB* model,
+                              DB* db,
+diff --git a/deps/leveldb/leveldb-1.20/util/env_posix.cc b/deps/leveldb/leveldb-1.20/util/env_posix.cc
+index b21f515a3..1a88802ed 100644
+--- a/deps/leveldb/leveldb-1.20/util/env_posix.cc
++++ b/deps/leveldb/leveldb-1.20/util/env_posix.cc
+@@ -34,6 +34,8 @@ namespace {
+ static int open_read_only_file_limit = -1;
+ static int mmap_limit = -1;
+ 
++static const size_t kBufSize = 65536;
++
+ static Status PosixError(const std::string& context, int err_number) {
+   if (err_number == ENOENT) {
+     return Status::NotFound(context, strerror(err_number));
+@@ -96,30 +98,32 @@ class Limiter {
+ class PosixSequentialFile: public SequentialFile {
+  private:
+   std::string filename_;
+-  FILE* file_;
++  int fd_;
+ 
+  public:
+-  PosixSequentialFile(const std::string& fname, FILE* f)
+-      : filename_(fname), file_(f) { }
+-  virtual ~PosixSequentialFile() { fclose(file_); }
++  PosixSequentialFile(const std::string& fname, int fd)
++      : filename_(fname), fd_(fd) {}
++  virtual ~PosixSequentialFile() { close(fd_); }
+ 
+   virtual Status Read(size_t n, Slice* result, char* scratch) {
+     Status s;
+-    size_t r = fread_unlocked(scratch, 1, n, file_);
+-    *result = Slice(scratch, r);
+-    if (r < n) {
+-      if (feof(file_)) {
+-        // We leave status as ok if we hit the end of the file
+-      } else {
+-        // A partial read with an error: return a non-ok status
++    while (true) {
++      ssize_t r = read(fd_, scratch, n);
++      if (r < 0) {
++        if (errno == EINTR) {
++          continue;  // Retry
++        }
+         s = PosixError(filename_, errno);
++        break;
+       }
++      *result = Slice(scratch, r);
++      break;
+     }
+     return s;
+   }
+ 
+   virtual Status Skip(uint64_t n) {
+-    if (fseek(file_, n, SEEK_CUR)) {
++    if (lseek(fd_, n, SEEK_CUR) == static_cast<off_t>(-1)) {
+       return PosixError(filename_, errno);
+     }
+     return Status::OK();
+@@ -213,42 +217,64 @@ class PosixMmapReadableFile: public RandomAccessFile {
+ 
+ class PosixWritableFile : public WritableFile {
+  private:
++  // buf_[0, pos_-1] contains data to be written to fd_.
+   std::string filename_;
+-  FILE* file_;
++  int fd_;
++  char buf_[kBufSize];
++  size_t pos_;
+ 
+  public:
+-  PosixWritableFile(const std::string& fname, FILE* f)
+-      : filename_(fname), file_(f) { }
++  PosixWritableFile(const std::string& fname, int fd)
++      : filename_(fname), fd_(fd), pos_(0) { }
+ 
+   ~PosixWritableFile() {
+-    if (file_ != NULL) {
++    if (fd_ >= 0) {
+       // Ignoring any potential errors
+-      fclose(file_);
++      FlushBuffered();
+     }
+   }
+ 
+   virtual Status Append(const Slice& data) {
+-    size_t r = fwrite_unlocked(data.data(), 1, data.size(), file_);
+-    if (r != data.size()) {
+-      return PosixError(filename_, errno);
++    size_t n = data.size();
++    const char* p = data.data();
++
++    // Fit as much as possible into buffer.
++    size_t copy = std::min(n, kBufSize - pos_);
++    memcpy(buf_ + pos_, p, copy);
++    p += copy;
++    n -= copy;
++    pos_ += copy;
++    if (n == 0) {
++      return Status::OK();
+     }
+-    return Status::OK();
++
++    // Can't fit in buffer, so need to do at least one write.
++    Status s = FlushBuffered();
++    if (!s.ok()) {
++      return s;
++    }
++
++    // Small writes go to buffer, large writes are written directly.
++    if (n < kBufSize) {
++      memcpy(buf_, p, n);
++      pos_ = n;
++      return Status::OK();
++    }
++    return WriteRaw(p, n);
+   }
+ 
+   virtual Status Close() {
+-    Status result;
+-    if (fclose(file_) != 0) {
++    Status result = FlushBuffered();
++    const int r = close(fd_);
++    if (r < 0 && result.ok()) {
+       result = PosixError(filename_, errno);
+     }
+-    file_ = NULL;
++    fd_ = -1;
+     return result;
+   }
+ 
+   virtual Status Flush() {
+-    if (fflush_unlocked(file_) != 0) {
+-      return PosixError(filename_, errno);
+-    }
+-    return Status::OK();
++    return FlushBuffered();
+   }
+ 
+   Status SyncDirIfManifest() {
+@@ -284,12 +310,36 @@ class PosixWritableFile : public WritableFile {
+     if (!s.ok()) {
+       return s;
+     }
+-    if (fflush_unlocked(file_) != 0 ||
+-        fdatasync(fileno(file_)) != 0) {
+-      s = Status::IOError(filename_, strerror(errno));
++    s = FlushBuffered();
++    if (s.ok()) {
++      if (fdatasync(fd_) != 0) {
++        s = PosixError(filename_, errno);
++      }
+     }
+     return s;
+   }
++
++ private:
++  Status FlushBuffered() {
++    Status s = WriteRaw(buf_, pos_);
++    pos_ = 0;
++    return s;
++  }
++
++  Status WriteRaw(const char* p, size_t n) {
++    while (n > 0) {
++      ssize_t r = write(fd_, p, n);
++      if (r < 0) {
++        if (errno == EINTR) {
++          continue;  // Retry
++        }
++        return PosixError(filename_, errno);
++      }
++      p += r;
++      n -= r;
++    }
++    return Status::OK();
++  }
+ };
+ 
+ static int LockOrUnlock(int fd, bool lock) {
+@@ -338,12 +388,12 @@ class PosixEnv : public Env {
+ 
+   virtual Status NewSequentialFile(const std::string& fname,
+                                    SequentialFile** result) {
+-    FILE* f = fopen(fname.c_str(), "r");
+-    if (f == NULL) {
++    int fd = open(fname.c_str(), O_RDONLY);
++    if (fd < 0) {
+       *result = NULL;
+       return PosixError(fname, errno);
+     } else {
+-      *result = new PosixSequentialFile(fname, f);
++      *result = new PosixSequentialFile(fname, fd);
+       return Status::OK();
+     }
+   }
+@@ -379,12 +429,12 @@ class PosixEnv : public Env {
+   virtual Status NewWritableFile(const std::string& fname,
+                                  WritableFile** result) {
+     Status s;
+-    FILE* f = fopen(fname.c_str(), "w");
+-    if (f == NULL) {
++    int fd = open(fname.c_str(), O_RDWR | O_CREAT, 0644);
++    if (fd < 0) {
+       *result = NULL;
+       s = PosixError(fname, errno);
+     } else {
+-      *result = new PosixWritableFile(fname, f);
++      *result = new PosixWritableFile(fname, fd);
+     }
+     return s;
+   }
+@@ -392,12 +442,12 @@ class PosixEnv : public Env {
+   virtual Status NewAppendableFile(const std::string& fname,
+                                    WritableFile** result) {
+     Status s;
+-    FILE* f = fopen(fname.c_str(), "a");
+-    if (f == NULL) {
++    int fd = open(fname.c_str(), O_APPEND | O_RDWR | O_CREAT, 0644);
++    if (fd < 0) {
+       *result = NULL;
+       s = PosixError(fname, errno);
+     } else {
+-      *result = new PosixWritableFile(fname, f);
++      *result = new PosixWritableFile(fname, fd);
+     }
+     return s;
+   }
+diff --git a/deps/leveldb/leveldb-1.20/util/env_test.cc b/deps/leveldb/leveldb-1.20/util/env_test.cc
+index 4d8ecc4a7..53ec923bc 100644
+--- a/deps/leveldb/leveldb-1.20/util/env_test.cc
++++ b/deps/leveldb/leveldb-1.20/util/env_test.cc
+@@ -6,6 +6,7 @@
+ 
+ #include "port/port.h"
+ #include "util/testharness.h"
++#include "util/testutil.h"
+ 
+ namespace leveldb {
+ 
+@@ -27,6 +28,55 @@ static void SetBool(void* ptr) {
+   reinterpret_cast<port::AtomicPointer*>(ptr)->NoBarrier_Store(ptr);
+ }
+ 
++
++TEST(EnvTest, ReadWrite) {
++  Random rnd(test::RandomSeed());
++
++  // Get file to use for testing.
++  std::string test_dir;
++  ASSERT_OK(env_->GetTestDirectory(&test_dir));
++  std::string test_file_name = test_dir + "/open_on_read.txt";
++  WritableFile* wfile_tmp;
++  ASSERT_OK(env_->NewWritableFile(test_file_name, &wfile_tmp));
++  std::unique_ptr<WritableFile> wfile(wfile_tmp);
++
++  // Fill a file with data generated via a sequence of randomly sized writes.
++  static const size_t kDataSize = 10 * 1048576;
++  std::string data;
++  while (data.size() < kDataSize) {
++    int len = rnd.Skewed(18);  // Up to 2^18 - 1, but typically much smaller
++    std::string r;
++    test::RandomString(&rnd, len, &r);
++    ASSERT_OK(wfile->Append(r));
++    data += r;
++    if (rnd.OneIn(10)) {
++      ASSERT_OK(wfile->Flush());
++    }
++  }
++  ASSERT_OK(wfile->Sync());
++  ASSERT_OK(wfile->Close());
++  wfile.reset();
++
++  // Read all data using a sequence of randomly sized reads.
++  SequentialFile* rfile_tmp;
++  ASSERT_OK(env_->NewSequentialFile(test_file_name, &rfile_tmp));
++  std::unique_ptr<SequentialFile> rfile(rfile_tmp);
++  std::string read_result;
++  std::string scratch;
++  while (read_result.size() < data.size()) {
++    int len = std::min<int>(rnd.Skewed(18), data.size() - read_result.size());
++    scratch.resize(std::max(len, 1));  // at least 1 so &scratch[0] is legal
++    Slice read;
++    ASSERT_OK(rfile->Read(len, &read, &scratch[0]));
++    if (len > 0) {
++      ASSERT_GT(read.size(), 0);
++    }
++    ASSERT_LE(read.size(), len);
++    read_result.append(read.data(), read.size());
++  }
++  ASSERT_EQ(read_result, data);
++}
++
+ TEST(EnvTest, RunImmediately) {
+   port::AtomicPointer called (NULL);
+   env_->Schedule(&SetBool, &called);
+
+From 1c75e88055e06da2939f9f4bd294625b76792815 Mon Sep 17 00:00:00 2001
+From: cmumford <cmumford@google.com>
+Date: Mon, 2 Oct 2017 13:57:41 -0700
+Subject: [PATCH 11/26] Fix use of uninitialized value in LRUHandle.
+
+If leveldb::Options::block_cache is set to a cache of zero capacity
+then it is possible for LRUHandle::next to be used without having been
+set.
+
+Conditional jump or move depends on uninitialised value(s):
+  leveldb::(anonymous namespace)::LRUHandle::key() const (cache.cc:58)
+  leveldb::(anonymous namespace)::LRUCache::Unref(leveldb::(anonymous namespace)::LRUHandle*) (cache.cc:234)
+  leveldb::(anonymous namespace)::LRUCache::Release(leveldb::Cache::Handle*) (cache.cc:266)
+  leveldb::(anonymous namespace)::ShardedLRUCache::Release(leveldb::Cache::Handle*) (cache.cc:375)
+  leveldb::CacheTest::Insert(int, int, int) (cache_test.cc:59)
+
+This bug forced a commit reversion in Chromium. For more information see
+https://bugs.chromium.org/p/chromium/issues/detail?id=761398#c4
+
+-------------
+Created by MOE: https://github.com/google/moe
+MOE_MIGRATED_REVID=170749054
+---
+ util/cache.cc      | 5 ++++-
+ util/cache_test.cc | 8 ++++++++
+ 2 files changed, 12 insertions(+), 1 deletion(-)
+
+diff --git a/deps/leveldb/leveldb-1.20/util/cache.cc b/deps/leveldb/leveldb-1.20/util/cache.cc
+index ce4688617..97b82ea6f 100644
+--- a/deps/leveldb/leveldb-1.20/util/cache.cc
++++ b/deps/leveldb/leveldb-1.20/util/cache.cc
+@@ -288,7 +288,10 @@ Cache::Handle* LRUCache::Insert(
+     LRU_Append(&in_use_, e);
+     usage_ += charge;
+     FinishErase(table_.Insert(e));
+-  } // else don't cache.  (Tests use capacity_==0 to turn off caching.)
++  } else {
++    // don't cache.  (It is valid to set capacity_==0 to turn off caching.)
++    e->next = NULL;
++  }
+ 
+   while (usage_ > capacity_ && lru_.next != &lru_) {
+     LRUHandle* old = lru_.next;
+diff --git a/deps/leveldb/leveldb-1.20/util/cache_test.cc b/deps/leveldb/leveldb-1.20/util/cache_test.cc
+index 468f7a642..246ab8efd 100644
+--- a/deps/leveldb/leveldb-1.20/util/cache_test.cc
++++ b/deps/leveldb/leveldb-1.20/util/cache_test.cc
+@@ -219,6 +219,14 @@ TEST(CacheTest, Prune) {
+   ASSERT_EQ(-1, Lookup(2));
+ }
+ 
++TEST(CacheTest, ZeroSizeCache) {
++  delete cache_;
++  cache_ = NewLRUCache(0);
++
++  Insert(1, 100);
++  ASSERT_EQ(-1, Lookup(1));
++}
++
+ }  // namespace leveldb
+ 
+ int main(int argc, char** argv) {
+
+From 2372ac574fdeb1235e70cdd86a2681d1ce05cf65 Mon Sep 17 00:00:00 2001
+From: sanjay <sanjay@google.com>
+Date: Mon, 2 Oct 2017 16:04:02 -0700
+Subject: [PATCH 12/26] Fix file writing bug in CL 170738066.
+
+If the file already existed, we should have truncated it. This was not
+detected by leveldb tests since leveldb code avoids reusing same files,
+but there was code elsewhere that was directly using leveldb files and
+relying on this behavior.
+
+-------------
+Created by MOE: https://github.com/google/moe
+MOE_MIGRATED_REVID=170769101
+---
+ util/env_posix.cc | 4 ++--
+ 1 file changed, 2 insertions(+), 2 deletions(-)
+
+diff --git a/deps/leveldb/leveldb-1.20/util/env_posix.cc b/deps/leveldb/leveldb-1.20/util/env_posix.cc
+index 1a88802ed..8d84ac729 100644
+--- a/deps/leveldb/leveldb-1.20/util/env_posix.cc
++++ b/deps/leveldb/leveldb-1.20/util/env_posix.cc
+@@ -429,7 +429,7 @@ class PosixEnv : public Env {
+   virtual Status NewWritableFile(const std::string& fname,
+                                  WritableFile** result) {
+     Status s;
+-    int fd = open(fname.c_str(), O_RDWR | O_CREAT, 0644);
++    int fd = open(fname.c_str(), O_TRUNC | O_WRONLY | O_CREAT, 0644);
+     if (fd < 0) {
+       *result = NULL;
+       s = PosixError(fname, errno);
+@@ -442,7 +442,7 @@ class PosixEnv : public Env {
+   virtual Status NewAppendableFile(const std::string& fname,
+                                    WritableFile** result) {
+     Status s;
+-    int fd = open(fname.c_str(), O_APPEND | O_RDWR | O_CREAT, 0644);
++    int fd = open(fname.c_str(), O_APPEND | O_WRONLY | O_CREAT, 0644);
+     if (fd < 0) {
+       *result = NULL;
+       s = PosixError(fname, errno);
+
+From 4447f9caced2bd09585c90f1b203c3aa8f4bbc40 Mon Sep 17 00:00:00 2001
+From: costan <costan@google.com>
+Date: Tue, 3 Oct 2017 10:33:01 -0700
+Subject: [PATCH 13/26] Remove handling for unused LRUHandle representation
+ special case.
+
+-------------
+Created by MOE: https://github.com/google/moe
+MOE_MIGRATED_REVID=170876103
+---
+ util/cache.cc | 17 +++++++----------
+ 1 file changed, 7 insertions(+), 10 deletions(-)
+
+diff --git a/deps/leveldb/leveldb-1.20/util/cache.cc b/deps/leveldb/leveldb-1.20/util/cache.cc
+index 97b82ea6f..bd914aea3 100644
+--- a/deps/leveldb/leveldb-1.20/util/cache.cc
++++ b/deps/leveldb/leveldb-1.20/util/cache.cc
+@@ -53,13 +53,11 @@ struct LRUHandle {
+   char key_data[1];   // Beginning of key
+ 
+   Slice key() const {
+-    // For cheaper lookups, we allow a temporary Handle object
+-    // to store a pointer to a key in "value".
+-    if (next == this) {
+-      return *(reinterpret_cast<Slice*>(value));
+-    } else {
+-      return Slice(key_data, key_length);
+-    }
++    // next_ is only equal to this if the LRU handle is the list head of an
++    // empty list. List heads never have meaningful keys.
++    assert(next != this);
++
++    return Slice(key_data, key_length);
+   }
+ };
+ 
+@@ -288,11 +286,10 @@ Cache::Handle* LRUCache::Insert(
+     LRU_Append(&in_use_, e);
+     usage_ += charge;
+     FinishErase(table_.Insert(e));
+-  } else {
+-    // don't cache.  (It is valid to set capacity_==0 to turn off caching.)
++  } else {  // don't cache. (capacity_==0 is supported and turns off caching.)
++    // next is read by key() in an assert, so it must be initialized
+     e->next = NULL;
+   }
+-
+   while (usage_ > capacity_ && lru_.next != &lru_) {
+     LRUHandle* old = lru_.next;
+     assert(old->refs == 1);
+
+From d9a9e02edf2b8187aa481416b36c49710026ab37 Mon Sep 17 00:00:00 2001
+From: costan <costan@google.com>
+Date: Tue, 3 Oct 2017 10:38:02 -0700
+Subject: [PATCH 14/26] leveldb: Add tests for CL 170769101.
+
+This also removes std::unique_ptr introduced in CL 170738066, because
+it's C++11-only, and the open source version still supports older
+versions at the moment.
+
+-------------
+Created by MOE: https://github.com/google/moe
+MOE_MIGRATED_REVID=170876919
+---
+ util/env_test.cc | 71 ++++++++++++++++++++++++++++++++++++++++++++++----------
+ 1 file changed, 59 insertions(+), 12 deletions(-)
+
+diff --git a/deps/leveldb/leveldb-1.20/util/env_test.cc b/deps/leveldb/leveldb-1.20/util/env_test.cc
+index 53ec923bc..87177528a 100644
+--- a/deps/leveldb/leveldb-1.20/util/env_test.cc
++++ b/deps/leveldb/leveldb-1.20/util/env_test.cc
+@@ -36,9 +36,8 @@ TEST(EnvTest, ReadWrite) {
+   std::string test_dir;
+   ASSERT_OK(env_->GetTestDirectory(&test_dir));
+   std::string test_file_name = test_dir + "/open_on_read.txt";
+-  WritableFile* wfile_tmp;
+-  ASSERT_OK(env_->NewWritableFile(test_file_name, &wfile_tmp));
+-  std::unique_ptr<WritableFile> wfile(wfile_tmp);
++  WritableFile* writable_file;
++  ASSERT_OK(env_->NewWritableFile(test_file_name, &writable_file));
+ 
+   // Fill a file with data generated via a sequence of randomly sized writes.
+   static const size_t kDataSize = 10 * 1048576;
+@@ -47,27 +46,26 @@ TEST(EnvTest, ReadWrite) {
+     int len = rnd.Skewed(18);  // Up to 2^18 - 1, but typically much smaller
+     std::string r;
+     test::RandomString(&rnd, len, &r);
+-    ASSERT_OK(wfile->Append(r));
++    ASSERT_OK(writable_file->Append(r));
+     data += r;
+     if (rnd.OneIn(10)) {
+-      ASSERT_OK(wfile->Flush());
++      ASSERT_OK(writable_file->Flush());
+     }
+   }
+-  ASSERT_OK(wfile->Sync());
+-  ASSERT_OK(wfile->Close());
+-  wfile.reset();
++  ASSERT_OK(writable_file->Sync());
++  ASSERT_OK(writable_file->Close());
++  delete writable_file;
+ 
+   // Read all data using a sequence of randomly sized reads.
+-  SequentialFile* rfile_tmp;
+-  ASSERT_OK(env_->NewSequentialFile(test_file_name, &rfile_tmp));
+-  std::unique_ptr<SequentialFile> rfile(rfile_tmp);
++  SequentialFile* sequential_file;
++  ASSERT_OK(env_->NewSequentialFile(test_file_name, &sequential_file));
+   std::string read_result;
+   std::string scratch;
+   while (read_result.size() < data.size()) {
+     int len = std::min<int>(rnd.Skewed(18), data.size() - read_result.size());
+     scratch.resize(std::max(len, 1));  // at least 1 so &scratch[0] is legal
+     Slice read;
+-    ASSERT_OK(rfile->Read(len, &read, &scratch[0]));
++    ASSERT_OK(sequential_file->Read(len, &read, &scratch[0]));
+     if (len > 0) {
+       ASSERT_GT(read.size(), 0);
+     }
+@@ -75,6 +73,7 @@ TEST(EnvTest, ReadWrite) {
+     read_result.append(read.data(), read.size());
+   }
+   ASSERT_EQ(read_result, data);
++  delete sequential_file;
+ }
+ 
+ TEST(EnvTest, RunImmediately) {
+@@ -167,6 +166,54 @@ TEST(EnvTest, TestOpenNonExistentFile) {
+   ASSERT_TRUE(status.IsNotFound());
+ }
+ 
++TEST(EnvTest, ReopenWritableFile) {
++  std::string test_dir;
++  ASSERT_OK(env_->GetTestDirectory(&test_dir));
++  std::string test_file_name = test_dir + "/reopen_writable_file.txt";
++  env_->DeleteFile(test_file_name);
++
++  WritableFile* writable_file;
++  ASSERT_OK(env_->NewWritableFile(test_file_name, &writable_file));
++  std::string data("hello world!");
++  ASSERT_OK(writable_file->Append(data));
++  ASSERT_OK(writable_file->Close());
++  delete writable_file;
++
++  ASSERT_OK(env_->NewWritableFile(test_file_name, &writable_file));
++  data = "42";
++  ASSERT_OK(writable_file->Append(data));
++  ASSERT_OK(writable_file->Close());
++  delete writable_file;
++
++  ASSERT_OK(ReadFileToString(env_, test_file_name, &data));
++  ASSERT_EQ(std::string("42"), data);
++  env_->DeleteFile(test_file_name);
++}
++
++TEST(EnvTest, ReopenAppendableFile) {
++  std::string test_dir;
++  ASSERT_OK(env_->GetTestDirectory(&test_dir));
++  std::string test_file_name = test_dir + "/reopen_appendable_file.txt";
++  env_->DeleteFile(test_file_name);
++
++  WritableFile* appendable_file;
++  ASSERT_OK(env_->NewAppendableFile(test_file_name, &appendable_file));
++  std::string data("hello world!");
++  ASSERT_OK(appendable_file->Append(data));
++  ASSERT_OK(appendable_file->Close());
++  delete appendable_file;
++
++  ASSERT_OK(env_->NewAppendableFile(test_file_name, &appendable_file));
++  data = "42";
++  ASSERT_OK(appendable_file->Append(data));
++  ASSERT_OK(appendable_file->Close());
++  delete appendable_file;
++
++  ASSERT_OK(ReadFileToString(env_, test_file_name, &data));
++  ASSERT_EQ(std::string("hello world!42"), data);
++  env_->DeleteFile(test_file_name);
++}
++
+ }  // namespace leveldb
+ 
+ int main(int argc, char** argv) {
+
+From 8ae7998aabae4f208d77afcb930dafabade1b28d Mon Sep 17 00:00:00 2001
+From: costan <costan@google.com>
+Date: Tue, 3 Oct 2017 13:41:46 -0700
+Subject: [PATCH 15/26] Fix FD leak in POSIX Env.
+
+Deleting a PosixWritableFile without calling Close() leaks the file
+descriptor. While the API description in include/leveldb/env.h does not
+specify whether the caller is responsible for Close()ing the file before
+deleting it, all other Env file implementations do release underlying
+resources when destroyed, even if Close() is not called.
+
+The leak shows up when running db_tests on Mac Travis, or on a vanilla
+MacOS install.
+
+-------------
+Created by MOE: https://github.com/google/moe
+MOE_MIGRATED_REVID=170906843
+---
+ util/env_posix.cc | 2 +-
+ 1 file changed, 1 insertion(+), 1 deletion(-)
+
+diff --git a/deps/leveldb/leveldb-1.20/util/env_posix.cc b/deps/leveldb/leveldb-1.20/util/env_posix.cc
+index 8d84ac729..832797840 100644
+--- a/deps/leveldb/leveldb-1.20/util/env_posix.cc
++++ b/deps/leveldb/leveldb-1.20/util/env_posix.cc
+@@ -230,7 +230,7 @@ class PosixWritableFile : public WritableFile {
+   ~PosixWritableFile() {
+     if (fd_ >= 0) {
+       // Ignoring any potential errors
+-      FlushBuffered();
++      Close();
+     }
+   }
+ 
+
+From 542590d2a8eee3838f40b01405baa6d2f6f8c700 Mon Sep 17 00:00:00 2001
+From: costan <costan@google.com>
+Date: Wed, 4 Oct 2017 10:04:21 -0700
+Subject: [PATCH 16/26] leveldb: Include <algorithm> in util/env_test.cc.
+
+CL 170738066 introduced std::min and std::max to env_test.cc. These
+require the <algorithm> header.
+
+-------------
+Created by MOE: https://github.com/google/moe
+MOE_MIGRATED_REVID=171024062
+---
+ util/env_test.cc | 2 ++
+ 1 file changed, 2 insertions(+)
+
+diff --git a/deps/leveldb/leveldb-1.20/util/env_test.cc b/deps/leveldb/leveldb-1.20/util/env_test.cc
+index 87177528a..0bf71211e 100644
+--- a/deps/leveldb/leveldb-1.20/util/env_test.cc
++++ b/deps/leveldb/leveldb-1.20/util/env_test.cc
+@@ -4,6 +4,8 @@
+ 
+ #include "leveldb/env.h"
+ 
++#include <algorithm>
++
+ #include "port/port.h"
+ #include "util/testharness.h"
+ #include "util/testutil.h"
+
+From 4a7e7f50dcf661cfffe71737650b0fb18e195d18 Mon Sep 17 00:00:00 2001
+From: cmumford <cmumford@google.com>
+Date: Wed, 4 Oct 2017 11:26:45 -0700
+Subject: [PATCH 17/26] Add LEVELDB_EXPORT macro to export public symbols.
+
+gcc defaults to exporting all symbols, but other linkers do not. Adding
+the LEVELDB_EXPORT macro allows a project to set LEVELDB_SHARED_LIBRARY
+when building/linking with leveldb as a shared library.
+
+This is to allow leveldb to be created as a shared library on all
+platforms support by Chrome and enables a fix for
+https://bugs.chromium.org/p/chromium/issues/detail?id=764810.
+
+This also has the benefit of reducing the shared library size from
+418863 to 380367 bytes (64-bit Linux).
+
+-------------
+Created by MOE: https://github.com/google/moe
+MOE_MIGRATED_REVID=171037148
+---
+ Makefile                        |  28 +++--
+ build_detect_platform           |   2 +-
+ include/leveldb/c.h             | 265 ++++++++++++++++++----------------------
+ include/leveldb/cache.h         |   7 +-
+ include/leveldb/comparator.h    |   5 +-
+ include/leveldb/db.h            |  13 +-
+ include/leveldb/dumpfile.h      |   4 +-
+ include/leveldb/env.h           |  27 ++--
+ include/leveldb/export.h        |  33 +++++
+ include/leveldb/filter_policy.h |   6 +-
+ include/leveldb/iterator.h      |   7 +-
+ include/leveldb/options.h       |   7 +-
+ include/leveldb/slice.h         |   3 +-
+ include/leveldb/status.h        |   3 +-
+ include/leveldb/table.h         |   3 +-
+ include/leveldb/table_builder.h |   3 +-
+ include/leveldb/write_batch.h   |   3 +-
+ 17 files changed, 226 insertions(+), 193 deletions(-)
+ create mode 100644 include/leveldb/export.h
+
+diff --git a/deps/leveldb/leveldb-1.20/Makefile b/deps/leveldb/leveldb-1.20/Makefile
+index f7cc7d736..4bd02a662 100644
+--- a/deps/leveldb/leveldb-1.20/Makefile
++++ b/deps/leveldb/leveldb-1.20/Makefile
+@@ -81,7 +81,7 @@ else
+ STATIC_OUTDIR=out-static
+ SHARED_OUTDIR=out-shared
+ STATIC_PROGRAMS := $(addprefix $(STATIC_OUTDIR)/, $(PROGNAMES))
+-SHARED_PROGRAMS := $(addprefix $(SHARED_OUTDIR)/, db_bench)
++SHARED_PROGRAMS := $(addprefix $(SHARED_OUTDIR)/, db_bench c_test)
+ endif
+ 
+ STATIC_LIBOBJECTS := $(addprefix $(STATIC_OUTDIR)/, $(SOURCES:.cc=.o))
+@@ -98,6 +98,7 @@ SHARED_MEMENVOBJECTS := $(addprefix $(SHARED_OUTDIR)/, $(MEMENV_SOURCES:.cc=.o))
+ 
+ TESTUTIL := $(STATIC_OUTDIR)/util/testutil.o
+ TESTHARNESS := $(STATIC_OUTDIR)/util/testharness.o $(TESTUTIL)
++TEST_STATIC_OBJS := $(STATIC_OUTDIR)/port/port_posix.o $(STATIC_OUTDIR)/port/port_posix_sse.o $(STATIC_OUTDIR)/util/crc32c.o $(STATIC_OUTDIR)/util/histogram.o
+ 
+ STATIC_TESTOBJS := $(addprefix $(STATIC_OUTDIR)/, $(addsuffix .o, $(TESTS)))
+ STATIC_UTILOBJS := $(addprefix $(STATIC_OUTDIR)/, $(addsuffix .o, $(UTILS)))
+@@ -112,6 +113,8 @@ ifneq ($(PLATFORM_SHARED_EXT),)
+ 
+ # Many leveldb test apps use non-exported API's. Only build a subset for testing.
+ SHARED_ALLOBJS := $(SHARED_LIBOBJECTS) $(SHARED_MEMENVOBJECTS) $(TESTHARNESS)
++SHARED_CXXFLAGS += -DLEVELDB_SHARED_LIBRARY
++SHARED_BUILD_CXXFLAGS += $(SHARED_CXXFLAGS) -DLEVELDB_COMPILE_LIBRARY
+ 
+ ifneq ($(PLATFORM_SHARED_VERSIONED),true)
+ SHARED_LIB1 = libleveldb.$(PLATFORM_SHARED_EXT)
+@@ -386,13 +389,20 @@ $(STATIC_OUTDIR)/write_batch_test:db/write_batch_test.cc $(STATIC_LIBOBJECTS) $(
+ $(STATIC_OUTDIR)/memenv_test:$(STATIC_OUTDIR)/helpers/memenv/memenv_test.o $(STATIC_OUTDIR)/libmemenv.a $(STATIC_OUTDIR)/libleveldb.a $(TESTHARNESS)
+ 	$(XCRUN) $(CXX) $(LDFLAGS) $(STATIC_OUTDIR)/helpers/memenv/memenv_test.o $(STATIC_OUTDIR)/libmemenv.a $(STATIC_OUTDIR)/libleveldb.a $(TESTHARNESS) -o $@ $(LIBS)
+ 
+-$(SHARED_OUTDIR)/db_bench:$(SHARED_OUTDIR)/db/db_bench.o $(SHARED_LIBS) $(TESTUTIL)
+-	$(XCRUN) $(CXX) $(LDFLAGS) $(CXXFLAGS) $(PLATFORM_SHARED_CFLAGS) $(SHARED_OUTDIR)/db/db_bench.o $(TESTUTIL) $(SHARED_OUTDIR)/$(SHARED_LIB3) -o $@ $(LIBS)
++$(SHARED_OUTDIR)/db_bench:$(SHARED_OUTDIR)/db/db_bench.o $(SHARED_LIBS) $(TESTUTIL) $(TEST_STATIC_OBJS)
++	$(XCRUN) $(CXX) $(LDFLAGS) $(CXXFLAGS) $(PLATFORM_SHARED_CFLAGS) $(SHARED_CXXFLAGS) $(SHARED_OUTDIR)/db/db_bench.o $(TESTUTIL) $(TEST_STATIC_OBJS) $(SHARED_OUTDIR)/$(SHARED_LIB3) -o $@ $(LIBS)
+ 
+-.PHONY: run-shared
+-run-shared: $(SHARED_OUTDIR)/db_bench
++$(SHARED_OUTDIR)/c_test:$(SHARED_OUTDIR)/db/c_test.o $(SHARED_LIBS) $(TESTUTIL) $(TEST_STATIC_OBJS)
++	$(XCRUN) $(CXX) $(LDFLAGS) $(CXXFLAGS) $(PLATFORM_SHARED_CFLAGS) $(SHARED_CXXFLAGS) $(SHARED_OUTDIR)/db/c_test.o $(TESTUTIL) $(TEST_STATIC_OBJS) $(SHARED_OUTDIR)/$(SHARED_LIB3) -o $@ $(LIBS)
++
++.PHONY: run-shared-db_bench
++run-shared-db_bench: $(SHARED_OUTDIR)/db_bench
+ 	LD_LIBRARY_PATH=$(SHARED_OUTDIR) $(SHARED_OUTDIR)/db_bench
+ 
++.PHONY: run-shared-c_test
++run-shared-c_test: $(SHARED_OUTDIR)/c_test
++	LD_LIBRARY_PATH=$(SHARED_OUTDIR) $(SHARED_OUTDIR)/c_test
++
+ $(SIMULATOR_OUTDIR)/%.o: %.cc
+ 	xcrun -sdk iphonesimulator $(CXX) $(CXXFLAGS) $(SIMULATOR_CFLAGS) -c $< -o $@
+ 
+@@ -412,13 +422,13 @@ $(STATIC_OUTDIR)/%.o: %.c
+ 	$(CC) $(CFLAGS) -c $< -o $@
+ 
+ $(SHARED_OUTDIR)/%.o: %.cc
+-	$(CXX) $(CXXFLAGS) $(PLATFORM_SHARED_CFLAGS) -c $< -o $@
++	$(CXX) $(CXXFLAGS) $(SHARED_BUILD_CXXFLAGS) $(PLATFORM_SHARED_CFLAGS) -c $< -o $@
+ 
+ $(SHARED_OUTDIR)/%.o: %.c
+-	$(CC) $(CFLAGS) $(PLATFORM_SHARED_CFLAGS) -c $< -o $@
++	$(CC) $(CFLAGS) $(SHARED_BUILD_CXXFLAGS) $(PLATFORM_SHARED_CFLAGS) -c $< -o $@
+ 
+ $(STATIC_OUTDIR)/port/port_posix_sse.o: port/port_posix_sse.cc
+-	$(CXX) $(CXXFLAGS) $(PLATFORM_SSEFLAGS) -c $< -o $@
++	$(CXX) $(CXXFLAGS) $(SHARED_BUILD_CXXFLAGS) $(PLATFORM_SSEFLAGS) -c $< -o $@
+ 
+ $(SHARED_OUTDIR)/port/port_posix_sse.o: port/port_posix_sse.cc
+-	$(CXX) $(CXXFLAGS) $(PLATFORM_SHARED_CFLAGS) $(PLATFORM_SSEFLAGS) -c $< -o $@
++	$(CXX) $(CXXFLAGS) $(SHARED_BUILD_CXXFLAGS) $(PLATFORM_SHARED_CFLAGS) $(PLATFORM_SSEFLAGS) -c $< -o $@
+diff --git a/deps/leveldb/leveldb-1.20/build_detect_platform b/deps/leveldb/leveldb-1.20/build_detect_platform
+index 85d359436..997730c29 100755
+--- a/deps/leveldb/leveldb-1.20/build_detect_platform
++++ b/deps/leveldb/leveldb-1.20/build_detect_platform
+@@ -61,7 +61,7 @@ PLATFORM_LDFLAGS=
+ PLATFORM_LIBS=
+ PLATFORM_SHARED_EXT="so"
+ PLATFORM_SHARED_LDFLAGS="-shared -Wl,-soname -Wl,"
+-PLATFORM_SHARED_CFLAGS="-fPIC"
++PLATFORM_SHARED_CFLAGS="-fPIC -fvisibility=hidden"
+ PLATFORM_SHARED_VERSIONED=true
+ PLATFORM_SSEFLAGS=
+ 
+diff --git a/deps/leveldb/leveldb-1.20/include/leveldb/c.h b/deps/leveldb/leveldb-1.20/include/leveldb/c.h
+index 1048fe3b8..7ac8121d5 100644
+--- a/deps/leveldb/leveldb-1.20/include/leveldb/c.h
++++ b/deps/leveldb/leveldb-1.20/include/leveldb/c.h
+@@ -47,6 +47,7 @@ extern "C" {
+ #include <stdarg.h>
+ #include <stddef.h>
+ #include <stdint.h>
++#include "leveldb/export.h"
+ 
+ /* Exported types */
+ 
+@@ -69,204 +70,178 @@ typedef struct leveldb_writeoptions_t  leveldb_writeoptions_t;
+ 
+ /* DB operations */
+ 
+-extern leveldb_t* leveldb_open(
+-    const leveldb_options_t* options,
+-    const char* name,
+-    char** errptr);
++LEVELDB_EXPORT leveldb_t* leveldb_open(const leveldb_options_t* options,
++                                       const char* name, char** errptr);
+ 
+-extern void leveldb_close(leveldb_t* db);
++LEVELDB_EXPORT void leveldb_close(leveldb_t* db);
+ 
+-extern void leveldb_put(
+-    leveldb_t* db,
+-    const leveldb_writeoptions_t* options,
+-    const char* key, size_t keylen,
+-    const char* val, size_t vallen,
+-    char** errptr);
++LEVELDB_EXPORT void leveldb_put(leveldb_t* db,
++                                const leveldb_writeoptions_t* options,
++                                const char* key, size_t keylen, const char* val,
++                                size_t vallen, char** errptr);
+ 
+-extern void leveldb_delete(
+-    leveldb_t* db,
+-    const leveldb_writeoptions_t* options,
+-    const char* key, size_t keylen,
+-    char** errptr);
++LEVELDB_EXPORT void leveldb_delete(leveldb_t* db,
++                                   const leveldb_writeoptions_t* options,
++                                   const char* key, size_t keylen,
++                                   char** errptr);
+ 
+-extern void leveldb_write(
+-    leveldb_t* db,
+-    const leveldb_writeoptions_t* options,
+-    leveldb_writebatch_t* batch,
+-    char** errptr);
++LEVELDB_EXPORT void leveldb_write(leveldb_t* db,
++                                  const leveldb_writeoptions_t* options,
++                                  leveldb_writebatch_t* batch, char** errptr);
+ 
+ /* Returns NULL if not found.  A malloc()ed array otherwise.
+    Stores the length of the array in *vallen. */
+-extern char* leveldb_get(
+-    leveldb_t* db,
+-    const leveldb_readoptions_t* options,
+-    const char* key, size_t keylen,
+-    size_t* vallen,
+-    char** errptr);
++LEVELDB_EXPORT char* leveldb_get(leveldb_t* db,
++                                 const leveldb_readoptions_t* options,
++                                 const char* key, size_t keylen, size_t* vallen,
++                                 char** errptr);
+ 
+-extern leveldb_iterator_t* leveldb_create_iterator(
+-    leveldb_t* db,
+-    const leveldb_readoptions_t* options);
++LEVELDB_EXPORT leveldb_iterator_t* leveldb_create_iterator(
++    leveldb_t* db, const leveldb_readoptions_t* options);
+ 
+-extern const leveldb_snapshot_t* leveldb_create_snapshot(
+-    leveldb_t* db);
++LEVELDB_EXPORT const leveldb_snapshot_t* leveldb_create_snapshot(leveldb_t* db);
+ 
+-extern void leveldb_release_snapshot(
+-    leveldb_t* db,
+-    const leveldb_snapshot_t* snapshot);
++LEVELDB_EXPORT void leveldb_release_snapshot(
++    leveldb_t* db, const leveldb_snapshot_t* snapshot);
+ 
+ /* Returns NULL if property name is unknown.
+    Else returns a pointer to a malloc()-ed null-terminated value. */
+-extern char* leveldb_property_value(
+-    leveldb_t* db,
+-    const char* propname);
+-
+-extern void leveldb_approximate_sizes(
+-    leveldb_t* db,
+-    int num_ranges,
+-    const char* const* range_start_key, const size_t* range_start_key_len,
+-    const char* const* range_limit_key, const size_t* range_limit_key_len,
+-    uint64_t* sizes);
+-
+-extern void leveldb_compact_range(
+-    leveldb_t* db,
+-    const char* start_key, size_t start_key_len,
+-    const char* limit_key, size_t limit_key_len);
++LEVELDB_EXPORT char* leveldb_property_value(leveldb_t* db,
++                                            const char* propname);
++
++LEVELDB_EXPORT void leveldb_approximate_sizes(
++    leveldb_t* db, int num_ranges, const char* const* range_start_key,
++    const size_t* range_start_key_len, const char* const* range_limit_key,
++    const size_t* range_limit_key_len, uint64_t* sizes);
++
++LEVELDB_EXPORT void leveldb_compact_range(leveldb_t* db, const char* start_key,
++                                          size_t start_key_len,
++                                          const char* limit_key,
++                                          size_t limit_key_len);
+ 
+ /* Management operations */
+ 
+-extern void leveldb_destroy_db(
+-    const leveldb_options_t* options,
+-    const char* name,
+-    char** errptr);
++LEVELDB_EXPORT void leveldb_destroy_db(const leveldb_options_t* options,
++                                       const char* name, char** errptr);
+ 
+-extern void leveldb_repair_db(
+-    const leveldb_options_t* options,
+-    const char* name,
+-    char** errptr);
++LEVELDB_EXPORT void leveldb_repair_db(const leveldb_options_t* options,
++                                      const char* name, char** errptr);
+ 
+ /* Iterator */
+ 
+-extern void leveldb_iter_destroy(leveldb_iterator_t*);
+-extern unsigned char leveldb_iter_valid(const leveldb_iterator_t*);
+-extern void leveldb_iter_seek_to_first(leveldb_iterator_t*);
+-extern void leveldb_iter_seek_to_last(leveldb_iterator_t*);
+-extern void leveldb_iter_seek(leveldb_iterator_t*, const char* k, size_t klen);
+-extern void leveldb_iter_next(leveldb_iterator_t*);
+-extern void leveldb_iter_prev(leveldb_iterator_t*);
+-extern const char* leveldb_iter_key(const leveldb_iterator_t*, size_t* klen);
+-extern const char* leveldb_iter_value(const leveldb_iterator_t*, size_t* vlen);
+-extern void leveldb_iter_get_error(const leveldb_iterator_t*, char** errptr);
++LEVELDB_EXPORT void leveldb_iter_destroy(leveldb_iterator_t*);
++LEVELDB_EXPORT unsigned char leveldb_iter_valid(const leveldb_iterator_t*);
++LEVELDB_EXPORT void leveldb_iter_seek_to_first(leveldb_iterator_t*);
++LEVELDB_EXPORT void leveldb_iter_seek_to_last(leveldb_iterator_t*);
++LEVELDB_EXPORT void leveldb_iter_seek(leveldb_iterator_t*, const char* k,
++                                      size_t klen);
++LEVELDB_EXPORT void leveldb_iter_next(leveldb_iterator_t*);
++LEVELDB_EXPORT void leveldb_iter_prev(leveldb_iterator_t*);
++LEVELDB_EXPORT const char* leveldb_iter_key(const leveldb_iterator_t*,
++                                            size_t* klen);
++LEVELDB_EXPORT const char* leveldb_iter_value(const leveldb_iterator_t*,
++                                              size_t* vlen);
++LEVELDB_EXPORT void leveldb_iter_get_error(const leveldb_iterator_t*,
++                                           char** errptr);
+ 
+ /* Write batch */
+ 
+-extern leveldb_writebatch_t* leveldb_writebatch_create();
+-extern void leveldb_writebatch_destroy(leveldb_writebatch_t*);
+-extern void leveldb_writebatch_clear(leveldb_writebatch_t*);
+-extern void leveldb_writebatch_put(
+-    leveldb_writebatch_t*,
+-    const char* key, size_t klen,
+-    const char* val, size_t vlen);
+-extern void leveldb_writebatch_delete(
+-    leveldb_writebatch_t*,
+-    const char* key, size_t klen);
+-extern void leveldb_writebatch_iterate(
+-    leveldb_writebatch_t*,
+-    void* state,
++LEVELDB_EXPORT leveldb_writebatch_t* leveldb_writebatch_create();
++LEVELDB_EXPORT void leveldb_writebatch_destroy(leveldb_writebatch_t*);
++LEVELDB_EXPORT void leveldb_writebatch_clear(leveldb_writebatch_t*);
++LEVELDB_EXPORT void leveldb_writebatch_put(leveldb_writebatch_t*,
++                                           const char* key, size_t klen,
++                                           const char* val, size_t vlen);
++LEVELDB_EXPORT void leveldb_writebatch_delete(leveldb_writebatch_t*,
++                                              const char* key, size_t klen);
++LEVELDB_EXPORT void leveldb_writebatch_iterate(
++    leveldb_writebatch_t*, void* state,
+     void (*put)(void*, const char* k, size_t klen, const char* v, size_t vlen),
+     void (*deleted)(void*, const char* k, size_t klen));
+ 
+ /* Options */
+ 
+-extern leveldb_options_t* leveldb_options_create();
+-extern void leveldb_options_destroy(leveldb_options_t*);
+-extern void leveldb_options_set_comparator(
+-    leveldb_options_t*,
+-    leveldb_comparator_t*);
+-extern void leveldb_options_set_filter_policy(
+-    leveldb_options_t*,
+-    leveldb_filterpolicy_t*);
+-extern void leveldb_options_set_create_if_missing(
+-    leveldb_options_t*, unsigned char);
+-extern void leveldb_options_set_error_if_exists(
+-    leveldb_options_t*, unsigned char);
+-extern void leveldb_options_set_paranoid_checks(
+-    leveldb_options_t*, unsigned char);
+-extern void leveldb_options_set_env(leveldb_options_t*, leveldb_env_t*);
+-extern void leveldb_options_set_info_log(leveldb_options_t*, leveldb_logger_t*);
+-extern void leveldb_options_set_write_buffer_size(leveldb_options_t*, size_t);
+-extern void leveldb_options_set_max_open_files(leveldb_options_t*, int);
+-extern void leveldb_options_set_cache(leveldb_options_t*, leveldb_cache_t*);
+-extern void leveldb_options_set_block_size(leveldb_options_t*, size_t);
+-extern void leveldb_options_set_block_restart_interval(leveldb_options_t*, int);
++LEVELDB_EXPORT leveldb_options_t* leveldb_options_create();
++LEVELDB_EXPORT void leveldb_options_destroy(leveldb_options_t*);
++LEVELDB_EXPORT void leveldb_options_set_comparator(leveldb_options_t*,
++                                                   leveldb_comparator_t*);
++LEVELDB_EXPORT void leveldb_options_set_filter_policy(leveldb_options_t*,
++                                                      leveldb_filterpolicy_t*);
++LEVELDB_EXPORT void leveldb_options_set_create_if_missing(leveldb_options_t*,
++                                                          unsigned char);
++LEVELDB_EXPORT void leveldb_options_set_error_if_exists(leveldb_options_t*,
++                                                        unsigned char);
++LEVELDB_EXPORT void leveldb_options_set_paranoid_checks(leveldb_options_t*,
++                                                        unsigned char);
++LEVELDB_EXPORT void leveldb_options_set_env(leveldb_options_t*, leveldb_env_t*);
++LEVELDB_EXPORT void leveldb_options_set_info_log(leveldb_options_t*,
++                                                 leveldb_logger_t*);
++LEVELDB_EXPORT void leveldb_options_set_write_buffer_size(leveldb_options_t*,
++                                                          size_t);
++LEVELDB_EXPORT void leveldb_options_set_max_open_files(leveldb_options_t*, int);
++LEVELDB_EXPORT void leveldb_options_set_cache(leveldb_options_t*,
++                                              leveldb_cache_t*);
++LEVELDB_EXPORT void leveldb_options_set_block_size(leveldb_options_t*, size_t);
++LEVELDB_EXPORT void leveldb_options_set_block_restart_interval(
++    leveldb_options_t*, int);
+ 
+ enum {
+   leveldb_no_compression = 0,
+   leveldb_snappy_compression = 1
+ };
+-extern void leveldb_options_set_compression(leveldb_options_t*, int);
++LEVELDB_EXPORT void leveldb_options_set_compression(leveldb_options_t*, int);
+ 
+ /* Comparator */
+ 
+-extern leveldb_comparator_t* leveldb_comparator_create(
+-    void* state,
+-    void (*destructor)(void*),
+-    int (*compare)(
+-        void*,
+-        const char* a, size_t alen,
+-        const char* b, size_t blen),
++LEVELDB_EXPORT leveldb_comparator_t* leveldb_comparator_create(
++    void* state, void (*destructor)(void*),
++    int (*compare)(void*, const char* a, size_t alen, const char* b,
++                   size_t blen),
+     const char* (*name)(void*));
+-extern void leveldb_comparator_destroy(leveldb_comparator_t*);
++LEVELDB_EXPORT void leveldb_comparator_destroy(leveldb_comparator_t*);
+ 
+ /* Filter policy */
+ 
+-extern leveldb_filterpolicy_t* leveldb_filterpolicy_create(
+-    void* state,
+-    void (*destructor)(void*),
+-    char* (*create_filter)(
+-        void*,
+-        const char* const* key_array, const size_t* key_length_array,
+-        int num_keys,
+-        size_t* filter_length),
+-    unsigned char (*key_may_match)(
+-        void*,
+-        const char* key, size_t length,
+-        const char* filter, size_t filter_length),
++LEVELDB_EXPORT leveldb_filterpolicy_t* leveldb_filterpolicy_create(
++    void* state, void (*destructor)(void*),
++    char* (*create_filter)(void*, const char* const* key_array,
++                           const size_t* key_length_array, int num_keys,
++                           size_t* filter_length),
++    unsigned char (*key_may_match)(void*, const char* key, size_t length,
++                                   const char* filter, size_t filter_length),
+     const char* (*name)(void*));
+-extern void leveldb_filterpolicy_destroy(leveldb_filterpolicy_t*);
++LEVELDB_EXPORT void leveldb_filterpolicy_destroy(leveldb_filterpolicy_t*);
+ 
+-extern leveldb_filterpolicy_t* leveldb_filterpolicy_create_bloom(
++LEVELDB_EXPORT leveldb_filterpolicy_t* leveldb_filterpolicy_create_bloom(
+     int bits_per_key);
+ 
+ /* Read options */
+ 
+-extern leveldb_readoptions_t* leveldb_readoptions_create();
+-extern void leveldb_readoptions_destroy(leveldb_readoptions_t*);
+-extern void leveldb_readoptions_set_verify_checksums(
+-    leveldb_readoptions_t*,
+-    unsigned char);
+-extern void leveldb_readoptions_set_fill_cache(
++LEVELDB_EXPORT leveldb_readoptions_t* leveldb_readoptions_create();
++LEVELDB_EXPORT void leveldb_readoptions_destroy(leveldb_readoptions_t*);
++LEVELDB_EXPORT void leveldb_readoptions_set_verify_checksums(
+     leveldb_readoptions_t*, unsigned char);
+-extern void leveldb_readoptions_set_snapshot(
+-    leveldb_readoptions_t*,
+-    const leveldb_snapshot_t*);
++LEVELDB_EXPORT void leveldb_readoptions_set_fill_cache(leveldb_readoptions_t*,
++                                                       unsigned char);
++LEVELDB_EXPORT void leveldb_readoptions_set_snapshot(leveldb_readoptions_t*,
++                                                     const leveldb_snapshot_t*);
+ 
+ /* Write options */
+ 
+-extern leveldb_writeoptions_t* leveldb_writeoptions_create();
+-extern void leveldb_writeoptions_destroy(leveldb_writeoptions_t*);
+-extern void leveldb_writeoptions_set_sync(
+-    leveldb_writeoptions_t*, unsigned char);
++LEVELDB_EXPORT leveldb_writeoptions_t* leveldb_writeoptions_create();
++LEVELDB_EXPORT void leveldb_writeoptions_destroy(leveldb_writeoptions_t*);
++LEVELDB_EXPORT void leveldb_writeoptions_set_sync(leveldb_writeoptions_t*,
++                                                  unsigned char);
+ 
+ /* Cache */
+ 
+-extern leveldb_cache_t* leveldb_cache_create_lru(size_t capacity);
+-extern void leveldb_cache_destroy(leveldb_cache_t* cache);
++LEVELDB_EXPORT leveldb_cache_t* leveldb_cache_create_lru(size_t capacity);
++LEVELDB_EXPORT void leveldb_cache_destroy(leveldb_cache_t* cache);
+ 
+ /* Env */
+ 
+-extern leveldb_env_t* leveldb_create_default_env();
+-extern void leveldb_env_destroy(leveldb_env_t*);
++LEVELDB_EXPORT leveldb_env_t* leveldb_create_default_env();
++LEVELDB_EXPORT void leveldb_env_destroy(leveldb_env_t*);
+ 
+ /* Utility */
+ 
+@@ -275,13 +250,13 @@ extern void leveldb_env_destroy(leveldb_env_t*);
+    in this file.  Note that in certain cases (typically on Windows), you
+    may need to call this routine instead of free(ptr) to dispose of
+    malloc()-ed memory returned by this library. */
+-extern void leveldb_free(void* ptr);
++LEVELDB_EXPORT void leveldb_free(void* ptr);
+ 
+ /* Return the major version number for this release. */
+-extern int leveldb_major_version();
++LEVELDB_EXPORT int leveldb_major_version();
+ 
+ /* Return the minor version number for this release. */
+-extern int leveldb_minor_version();
++LEVELDB_EXPORT int leveldb_minor_version();
+ 
+ #ifdef __cplusplus
+ }  /* end extern "C" */
+diff --git a/deps/leveldb/leveldb-1.20/include/leveldb/cache.h b/deps/leveldb/leveldb-1.20/include/leveldb/cache.h
+index 6819d5bc4..ed18baaa5 100644
+--- a/deps/leveldb/leveldb-1.20/include/leveldb/cache.h
++++ b/deps/leveldb/leveldb-1.20/include/leveldb/cache.h
+@@ -19,17 +19,18 @@
+ #define STORAGE_LEVELDB_INCLUDE_CACHE_H_
+ 
+ #include <stdint.h>
++#include "leveldb/export.h"
+ #include "leveldb/slice.h"
+ 
+ namespace leveldb {
+ 
+-class Cache;
++class LEVELDB_EXPORT Cache;
+ 
+ // Create a new cache with a fixed size capacity.  This implementation
+ // of Cache uses a least-recently-used eviction policy.
+-extern Cache* NewLRUCache(size_t capacity);
++LEVELDB_EXPORT Cache* NewLRUCache(size_t capacity);
+ 
+-class Cache {
++class LEVELDB_EXPORT Cache {
+  public:
+   Cache() { }
+ 
+diff --git a/deps/leveldb/leveldb-1.20/include/leveldb/comparator.h b/deps/leveldb/leveldb-1.20/include/leveldb/comparator.h
+index 556b984c7..9b09684a6 100644
+--- a/deps/leveldb/leveldb-1.20/include/leveldb/comparator.h
++++ b/deps/leveldb/leveldb-1.20/include/leveldb/comparator.h
+@@ -6,6 +6,7 @@
+ #define STORAGE_LEVELDB_INCLUDE_COMPARATOR_H_
+ 
+ #include <string>
++#include "leveldb/export.h"
+ 
+ namespace leveldb {
+ 
+@@ -15,7 +16,7 @@ class Slice;
+ // used as keys in an sstable or a database.  A Comparator implementation
+ // must be thread-safe since leveldb may invoke its methods concurrently
+ // from multiple threads.
+-class Comparator {
++class LEVELDB_EXPORT Comparator {
+  public:
+   virtual ~Comparator();
+ 
+@@ -56,7 +57,7 @@ class Comparator {
+ // Return a builtin comparator that uses lexicographic byte-wise
+ // ordering.  The result remains the property of this module and
+ // must not be deleted.
+-extern const Comparator* BytewiseComparator();
++LEVELDB_EXPORT const Comparator* BytewiseComparator();
+ 
+ }  // namespace leveldb
+ 
+diff --git a/deps/leveldb/leveldb-1.20/include/leveldb/db.h b/deps/leveldb/leveldb-1.20/include/leveldb/db.h
+index bfab10a0b..9a18c92f1 100644
+--- a/deps/leveldb/leveldb-1.20/include/leveldb/db.h
++++ b/deps/leveldb/leveldb-1.20/include/leveldb/db.h
+@@ -7,6 +7,7 @@
+ 
+ #include <stdint.h>
+ #include <stdio.h>
++#include "leveldb/export.h"
+ #include "leveldb/iterator.h"
+ #include "leveldb/options.h"
+ 
+@@ -24,13 +25,13 @@ class WriteBatch;
+ // Abstract handle to particular state of a DB.
+ // A Snapshot is an immutable object and can therefore be safely
+ // accessed from multiple threads without any external synchronization.
+-class Snapshot {
++class LEVELDB_EXPORT Snapshot {
+  protected:
+   virtual ~Snapshot();
+ };
+ 
+ // A range of keys
+-struct Range {
++struct LEVELDB_EXPORT Range {
+   Slice start;          // Included in the range
+   Slice limit;          // Not included in the range
+ 
+@@ -41,7 +42,7 @@ struct Range {
+ // A DB is a persistent ordered map from keys to values.
+ // A DB is safe for concurrent access from multiple threads without
+ // any external synchronization.
+-class DB {
++class LEVELDB_EXPORT DB {
+  public:
+   // Open the database with the specified "name".
+   // Stores a pointer to a heap-allocated database in *dbptr and returns
+@@ -150,13 +151,15 @@ class DB {
+ 
+ // Destroy the contents of the specified database.
+ // Be very careful using this method.
+-Status DestroyDB(const std::string& name, const Options& options);
++LEVELDB_EXPORT Status DestroyDB(const std::string& name,
++                                const Options& options);
+ 
+ // If a DB cannot be opened, you may attempt to call this method to
+ // resurrect as much of the contents of the database as possible.
+ // Some data may be lost, so be careful when calling this function
+ // on a database that contains important information.
+-Status RepairDB(const std::string& dbname, const Options& options);
++LEVELDB_EXPORT Status RepairDB(const std::string& dbname,
++                               const Options& options);
+ 
+ }  // namespace leveldb
+ 
+diff --git a/deps/leveldb/leveldb-1.20/include/leveldb/dumpfile.h b/deps/leveldb/leveldb-1.20/include/leveldb/dumpfile.h
+index 3f97fda16..659774163 100644
+--- a/deps/leveldb/leveldb-1.20/include/leveldb/dumpfile.h
++++ b/deps/leveldb/leveldb-1.20/include/leveldb/dumpfile.h
+@@ -7,6 +7,7 @@
+ 
+ #include <string>
+ #include "leveldb/env.h"
++#include "leveldb/export.h"
+ #include "leveldb/status.h"
+ 
+ namespace leveldb {
+@@ -18,7 +19,8 @@ namespace leveldb {
+ //
+ // Returns a non-OK result if fname does not name a leveldb storage
+ // file, or if the file cannot be read.
+-Status DumpFile(Env* env, const std::string& fname, WritableFile* dst);
++LEVELDB_EXPORT Status DumpFile(Env* env, const std::string& fname,
++                               WritableFile* dst);
+ 
+ }  // namespace leveldb
+ 
+diff --git a/deps/leveldb/leveldb-1.20/include/leveldb/env.h b/deps/leveldb/leveldb-1.20/include/leveldb/env.h
+index cb8b6a465..d698169e6 100644
+--- a/deps/leveldb/leveldb-1.20/include/leveldb/env.h
++++ b/deps/leveldb/leveldb-1.20/include/leveldb/env.h
+@@ -13,10 +13,11 @@
+ #ifndef STORAGE_LEVELDB_INCLUDE_ENV_H_
+ #define STORAGE_LEVELDB_INCLUDE_ENV_H_
+ 
+-#include <string>
+-#include <vector>
+ #include <stdarg.h>
+ #include <stdint.h>
++#include <string>
++#include <vector>
++#include "leveldb/export.h"
+ #include "leveldb/status.h"
+ 
+ namespace leveldb {
+@@ -28,7 +29,7 @@ class SequentialFile;
+ class Slice;
+ class WritableFile;
+ 
+-class Env {
++class LEVELDB_EXPORT Env {
+  public:
+   Env() { }
+   virtual ~Env();
+@@ -169,7 +170,7 @@ class Env {
+ };
+ 
+ // A file abstraction for reading sequentially through a file
+-class SequentialFile {
++class LEVELDB_EXPORT SequentialFile {
+  public:
+   SequentialFile() { }
+   virtual ~SequentialFile();
+@@ -200,7 +201,7 @@ class SequentialFile {
+ };
+ 
+ // A file abstraction for randomly reading the contents of a file.
+-class RandomAccessFile {
++class LEVELDB_EXPORT RandomAccessFile {
+  public:
+   RandomAccessFile() { }
+   virtual ~RandomAccessFile();
+@@ -226,7 +227,7 @@ class RandomAccessFile {
+ // A file abstraction for sequential writing.  The implementation
+ // must provide buffering since callers may append small fragments
+ // at a time to the file.
+-class WritableFile {
++class LEVELDB_EXPORT WritableFile {
+  public:
+   WritableFile() { }
+   virtual ~WritableFile();
+@@ -243,7 +244,7 @@ class WritableFile {
+ };
+ 
+ // An interface for writing log messages.
+-class Logger {
++class LEVELDB_EXPORT Logger {
+  public:
+   Logger() { }
+   virtual ~Logger();
+@@ -259,7 +260,7 @@ class Logger {
+ 
+ 
+ // Identifies a locked file.
+-class FileLock {
++class LEVELDB_EXPORT FileLock {
+  public:
+   FileLock() { }
+   virtual ~FileLock();
+@@ -277,17 +278,17 @@ extern void Log(Logger* info_log, const char* format, ...)
+     ;
+ 
+ // A utility routine: write "data" to the named file.
+-extern Status WriteStringToFile(Env* env, const Slice& data,
+-                                const std::string& fname);
++LEVELDB_EXPORT Status WriteStringToFile(Env* env, const Slice& data,
++                                        const std::string& fname);
+ 
+ // A utility routine: read contents of named file into *data
+-extern Status ReadFileToString(Env* env, const std::string& fname,
+-                               std::string* data);
++LEVELDB_EXPORT Status ReadFileToString(Env* env, const std::string& fname,
++                                       std::string* data);
+ 
+ // An implementation of Env that forwards all calls to another Env.
+ // May be useful to clients who wish to override just part of the
+ // functionality of another Env.
+-class EnvWrapper : public Env {
++class LEVELDB_EXPORT EnvWrapper : public Env {
+  public:
+   // Initialize an EnvWrapper that delegates all calls to *t
+   explicit EnvWrapper(Env* t) : target_(t) { }
+diff --git a/deps/leveldb/leveldb-1.20/include/leveldb/export.h b/deps/leveldb/leveldb-1.20/include/leveldb/export.h
+new file mode 100644
+index 000000000..39b20972a
+--- /dev/null
++++ b/deps/leveldb/leveldb-1.20/include/leveldb/export.h
+@@ -0,0 +1,33 @@
++// Copyright (c) 2017 The LevelDB Authors. All rights reserved.
++// Use of this source code is governed by a BSD-style license that can be
++// found in the LICENSE file. See the AUTHORS file for names of contributors.
++
++#ifndef STORAGE_LEVELDB_INCLUDE_EXPORT_H_
++#define STORAGE_LEVELDB_INCLUDE_EXPORT_H_
++
++#if !defined(LEVELDB_EXPORT)
++
++#if defined(LEVELDB_SHARED_LIBRARY)
++#if defined(OS_WIN)
++
++#if defined(LEVELDB_COMPILE_LIBRARY)
++#define LEVELDB_EXPORT __declspec(dllexport)
++#else
++#define LEVELDB_EXPORT __declspec(dllimport)
++#endif  // defined(LEVELDB_COMPILE_LIBRARY)
++
++#else  // defined(OS_WIN)
++#if defined(LEVELDB_COMPILE_LIBRARY)
++#define LEVELDB_EXPORT __attribute__((visibility("default")))
++#else
++#define LEVELDB_EXPORT
++#endif
++#endif  // defined(OS_WIN)
++
++#else  // defined(LEVELDB_SHARED_LIBRARY)
++#define LEVELDB_EXPORT
++#endif
++
++#endif  // !defined(LEVELDB_EXPORT)
++
++#endif  // STORAGE_LEVELDB_INCLUDE_EXPORT_H_
+diff --git a/deps/leveldb/leveldb-1.20/include/leveldb/filter_policy.h b/deps/leveldb/leveldb-1.20/include/leveldb/filter_policy.h
+index 1fba08001..c3a5d208a 100644
+--- a/deps/leveldb/leveldb-1.20/include/leveldb/filter_policy.h
++++ b/deps/leveldb/leveldb-1.20/include/leveldb/filter_policy.h
+@@ -17,12 +17,13 @@
+ #define STORAGE_LEVELDB_INCLUDE_FILTER_POLICY_H_
+ 
+ #include <string>
++#include "leveldb/export.h"
+ 
+ namespace leveldb {
+ 
+ class Slice;
+ 
+-class FilterPolicy {
++class LEVELDB_EXPORT FilterPolicy {
+  public:
+   virtual ~FilterPolicy();
+ 
+@@ -63,8 +64,7 @@ class FilterPolicy {
+ // ignores trailing spaces, it would be incorrect to use a
+ // FilterPolicy (like NewBloomFilterPolicy) that does not ignore
+ // trailing spaces in keys.
+-extern const FilterPolicy* NewBloomFilterPolicy(int bits_per_key);
+-
++LEVELDB_EXPORT const FilterPolicy* NewBloomFilterPolicy(int bits_per_key);
+ }
+ 
+ #endif  // STORAGE_LEVELDB_INCLUDE_FILTER_POLICY_H_
+diff --git a/deps/leveldb/leveldb-1.20/include/leveldb/iterator.h b/deps/leveldb/leveldb-1.20/include/leveldb/iterator.h
+index da631ed9d..ff3b56629 100644
+--- a/deps/leveldb/leveldb-1.20/include/leveldb/iterator.h
++++ b/deps/leveldb/leveldb-1.20/include/leveldb/iterator.h
+@@ -15,12 +15,13 @@
+ #ifndef STORAGE_LEVELDB_INCLUDE_ITERATOR_H_
+ #define STORAGE_LEVELDB_INCLUDE_ITERATOR_H_
+ 
++#include "leveldb/export.h"
+ #include "leveldb/slice.h"
+ #include "leveldb/status.h"
+ 
+ namespace leveldb {
+ 
+-class Iterator {
++class LEVELDB_EXPORT Iterator {
+  public:
+   Iterator();
+   virtual ~Iterator();
+@@ -90,10 +91,10 @@ class Iterator {
+ };
+ 
+ // Return an empty iterator (yields nothing).
+-extern Iterator* NewEmptyIterator();
++LEVELDB_EXPORT Iterator* NewEmptyIterator();
+ 
+ // Return an empty iterator with the specified status.
+-extern Iterator* NewErrorIterator(const Status& status);
++LEVELDB_EXPORT Iterator* NewErrorIterator(const Status& status);
+ 
+ }  // namespace leveldb
+ 
+diff --git a/deps/leveldb/leveldb-1.20/include/leveldb/options.h b/deps/leveldb/leveldb-1.20/include/leveldb/options.h
+index 976e38122..1c4292157 100644
+--- a/deps/leveldb/leveldb-1.20/include/leveldb/options.h
++++ b/deps/leveldb/leveldb-1.20/include/leveldb/options.h
+@@ -6,6 +6,7 @@
+ #define STORAGE_LEVELDB_INCLUDE_OPTIONS_H_
+ 
+ #include <stddef.h>
++#include "leveldb/export.h"
+ 
+ namespace leveldb {
+ 
+@@ -28,7 +29,7 @@ enum CompressionType {
+ };
+ 
+ // Options to control the behavior of a database (passed to DB::Open)
+-struct Options {
++struct LEVELDB_EXPORT Options {
+   // -------------------
+   // Parameters that affect behavior
+ 
+@@ -158,7 +159,7 @@ struct Options {
+ };
+ 
+ // Options that control read operations
+-struct ReadOptions {
++struct LEVELDB_EXPORT ReadOptions {
+   // If true, all data read from underlying storage will be
+   // verified against corresponding checksums.
+   // Default: false
+@@ -184,7 +185,7 @@ struct ReadOptions {
+ };
+ 
+ // Options that control write operations
+-struct WriteOptions {
++struct LEVELDB_EXPORT WriteOptions {
+   // If true, the write will be flushed from the operating system
+   // buffer cache (by calling WritableFile::Sync()) before the write
+   // is considered complete.  If this flag is true, writes will be
+diff --git a/deps/leveldb/leveldb-1.20/include/leveldb/slice.h b/deps/leveldb/leveldb-1.20/include/leveldb/slice.h
+index bc367986f..b56a4e4f3 100644
+--- a/deps/leveldb/leveldb-1.20/include/leveldb/slice.h
++++ b/deps/leveldb/leveldb-1.20/include/leveldb/slice.h
+@@ -19,10 +19,11 @@
+ #include <stddef.h>
+ #include <string.h>
+ #include <string>
++#include "leveldb/export.h"
+ 
+ namespace leveldb {
+ 
+-class Slice {
++class LEVELDB_EXPORT Slice {
+  public:
+   // Create an empty slice.
+   Slice() : data_(""), size_(0) { }
+diff --git a/deps/leveldb/leveldb-1.20/include/leveldb/status.h b/deps/leveldb/leveldb-1.20/include/leveldb/status.h
+index d9575f975..42ad4bbbc 100644
+--- a/deps/leveldb/leveldb-1.20/include/leveldb/status.h
++++ b/deps/leveldb/leveldb-1.20/include/leveldb/status.h
+@@ -14,11 +14,12 @@
+ #define STORAGE_LEVELDB_INCLUDE_STATUS_H_
+ 
+ #include <string>
++#include "leveldb/export.h"
+ #include "leveldb/slice.h"
+ 
+ namespace leveldb {
+ 
+-class Status {
++class LEVELDB_EXPORT Status {
+  public:
+   // Create a success status.
+   Status() : state_(NULL) { }
+diff --git a/deps/leveldb/leveldb-1.20/include/leveldb/table.h b/deps/leveldb/leveldb-1.20/include/leveldb/table.h
+index a9746c3f5..2f54c4ea3 100644
+--- a/deps/leveldb/leveldb-1.20/include/leveldb/table.h
++++ b/deps/leveldb/leveldb-1.20/include/leveldb/table.h
+@@ -6,6 +6,7 @@
+ #define STORAGE_LEVELDB_INCLUDE_TABLE_H_
+ 
+ #include <stdint.h>
++#include "leveldb/export.h"
+ #include "leveldb/iterator.h"
+ 
+ namespace leveldb {
+@@ -21,7 +22,7 @@ class TableCache;
+ // A Table is a sorted map from strings to strings.  Tables are
+ // immutable and persistent.  A Table may be safely accessed from
+ // multiple threads without external synchronization.
+-class Table {
++class LEVELDB_EXPORT Table {
+  public:
+   // Attempt to open the table that is stored in bytes [0..file_size)
+   // of "file", and read the metadata entries necessary to allow
+diff --git a/deps/leveldb/leveldb-1.20/include/leveldb/table_builder.h b/deps/leveldb/leveldb-1.20/include/leveldb/table_builder.h
+index 5fd1dc71f..3c3acc732 100644
+--- a/deps/leveldb/leveldb-1.20/include/leveldb/table_builder.h
++++ b/deps/leveldb/leveldb-1.20/include/leveldb/table_builder.h
+@@ -14,6 +14,7 @@
+ #define STORAGE_LEVELDB_INCLUDE_TABLE_BUILDER_H_
+ 
+ #include <stdint.h>
++#include "leveldb/export.h"
+ #include "leveldb/options.h"
+ #include "leveldb/status.h"
+ 
+@@ -23,7 +24,7 @@ class BlockBuilder;
+ class BlockHandle;
+ class WritableFile;
+ 
+-class TableBuilder {
++class LEVELDB_EXPORT TableBuilder {
+  public:
+   // Create a builder that will store the contents of the table it is
+   // building in *file.  Does not close the file.  It is up to the
+diff --git a/deps/leveldb/leveldb-1.20/include/leveldb/write_batch.h b/deps/leveldb/leveldb-1.20/include/leveldb/write_batch.h
+index 65a76d84d..40ceb0321 100644
+--- a/deps/leveldb/leveldb-1.20/include/leveldb/write_batch.h
++++ b/deps/leveldb/leveldb-1.20/include/leveldb/write_batch.h
+@@ -22,13 +22,14 @@
+ #define STORAGE_LEVELDB_INCLUDE_WRITE_BATCH_H_
+ 
+ #include <string>
++#include "leveldb/export.h"
+ #include "leveldb/status.h"
+ 
+ namespace leveldb {
+ 
+ class Slice;
+ 
+-class WriteBatch {
++class LEVELDB_EXPORT WriteBatch {
+  public:
+   WriteBatch();
+   ~WriteBatch();
+
+From 25767d066ca995c055f04b78a31a6e518087e667 Mon Sep 17 00:00:00 2001
+From: costan <costan@google.com>
+Date: Thu, 5 Oct 2017 08:08:48 -0700
+Subject: [PATCH 18/26] leveldb: Remove *_unlocked feature detection from POSIX
+ port.
+
+CL 170738066 removed all instances of fread_unlocked, fwrite_unlocked
+and fflush_unlocked calls from the codebase, so the feature detection
+can be removed as well.
+
+-------------
+Created by MOE: https://github.com/google/moe
+MOE_MIGRATED_REVID=171154269
+---
+ port/port_posix.h | 9 ---------
+ 1 file changed, 9 deletions(-)
+
+diff --git a/deps/leveldb/leveldb-1.20/port/port_posix.h b/deps/leveldb/leveldb-1.20/port/port_posix.h
+index 24915512c..1f4f6fc1a 100644
+--- a/deps/leveldb/leveldb-1.20/port/port_posix.h
++++ b/deps/leveldb/leveldb-1.20/port/port_posix.h
+@@ -50,15 +50,6 @@
+ #define PLATFORM_IS_LITTLE_ENDIAN (__BYTE_ORDER == __LITTLE_ENDIAN)
+ #endif
+ 
+-#if defined(__APPLE__) || defined(OS_SOLARIS) || defined(OS_FREEBSD) ||\
+-    defined(OS_NETBSD) || defined(OS_OPENBSD) || defined(OS_DRAGONFLYBSD) ||\
+-    defined(OS_ANDROID) || defined(OS_HPUX) || defined(CYGWIN)
+-// Use fread/fwrite/fflush on platforms without _unlocked variants
+-#define fread_unlocked fread
+-#define fwrite_unlocked fwrite
+-#define fflush_unlocked fflush
+-#endif
+-
+ #if defined(__APPLE__) || defined(OS_FREEBSD) ||\
+     defined(OS_OPENBSD) || defined(OS_DRAGONFLYBSD)
+ // Use fsync() on platforms without fdatasync()
+
+From ca216e493f32278f50a823811ab95f64cf0f839b Mon Sep 17 00:00:00 2001
+From: costan <costan@google.com>
+Date: Thu, 5 Oct 2017 11:47:39 -0700
+Subject: [PATCH 19/26] leveldb: Rename SNAPPY to HAVE_SNAPPY.
+
+This follows the general naming convention for preprocessor macros used
+to detect feature (library / header file / symbol) presence.
+
+-------------
+Created by MOE: https://github.com/google/moe
+MOE_MIGRATED_REVID=171184641
+---
+ build_detect_platform | 12 ++++++------
+ port/port_posix.h     | 16 ++++++++--------
+ 2 files changed, 14 insertions(+), 14 deletions(-)
+
+diff --git a/deps/leveldb/leveldb-1.20/build_detect_platform b/deps/leveldb/leveldb-1.20/build_detect_platform
+index 997730c29..d1bb17e37 100755
+--- a/deps/leveldb/leveldb-1.20/build_detect_platform
++++ b/deps/leveldb/leveldb-1.20/build_detect_platform
+@@ -21,8 +21,8 @@
+ # The PLATFORM_CCFLAGS and PLATFORM_CXXFLAGS might include the following:
+ #
+ #       -DLEVELDB_ATOMIC_PRESENT     if <atomic> is present
+-#       -DLEVELDB_PLATFORM_POSIX     for Posix-based platforms
+-#       -DSNAPPY                     if the Snappy library is present
++#       -DLEVELDB_PLATFORM_POSIX=1   for Posix-based platforms
++#       -DHAVE_SNAPPY=1              if the Snappy library is present
+ #
+ 
+ OUTPUT=$1
+@@ -133,7 +133,7 @@ case "$TARGET_OS" in
+         ;;
+     OS_ANDROID_CROSSCOMPILE)
+         PLATFORM=OS_ANDROID
+-        COMMON_FLAGS="$MEMCMP_FLAG -D_REENTRANT -DOS_ANDROID -DLEVELDB_PLATFORM_POSIX"
++        COMMON_FLAGS="$MEMCMP_FLAG -D_REENTRANT -DOS_ANDROID -DLEVELDB_PLATFORM_POSIX=1"
+         PLATFORM_LDFLAGS=""  # All pthread features are in the Android C library
+         PORT_FILE=port/port_posix.cc
+         PORT_SSE_FILE=port/port_posix_sse.cc
+@@ -196,10 +196,10 @@ else
+       int main() {}
+ EOF
+     if [ "$?" = 0 ]; then
+-        COMMON_FLAGS="$COMMON_FLAGS -DLEVELDB_PLATFORM_POSIX -DLEVELDB_ATOMIC_PRESENT"
++        COMMON_FLAGS="$COMMON_FLAGS -DLEVELDB_PLATFORM_POSIX=1 -DLEVELDB_ATOMIC_PRESENT"
+         PLATFORM_CXXFLAGS="-std=c++0x"
+     else
+-        COMMON_FLAGS="$COMMON_FLAGS -DLEVELDB_PLATFORM_POSIX"
++        COMMON_FLAGS="$COMMON_FLAGS -DLEVELDB_PLATFORM_POSIX=1"
+     fi
+ 
+     # Test whether Snappy library is installed
+@@ -209,7 +209,7 @@ EOF
+       int main() {}
+ EOF
+     if [ "$?" = 0 ]; then
+-        COMMON_FLAGS="$COMMON_FLAGS -DSNAPPY"
++        COMMON_FLAGS="$COMMON_FLAGS -DHAVE_SNAPPY=1"
+         PLATFORM_LIBS="$PLATFORM_LIBS -lsnappy"
+     fi
+ 
+diff --git a/deps/leveldb/leveldb-1.20/port/port_posix.h b/deps/leveldb/leveldb-1.20/port/port_posix.h
+index 1f4f6fc1a..2bc5223d5 100644
+--- a/deps/leveldb/leveldb-1.20/port/port_posix.h
++++ b/deps/leveldb/leveldb-1.20/port/port_posix.h
+@@ -39,9 +39,9 @@
+ #endif
+ 
+ #include <pthread.h>
+-#ifdef SNAPPY
++#ifdef HAVE_SNAPPY
+ #include <snappy.h>
+-#endif
++#endif  // defined(HAVE_SNAPPY)
+ #include <stdint.h>
+ #include <string>
+ #include "port/atomic_pointer.h"
+@@ -106,33 +106,33 @@ extern void InitOnce(OnceType* once, void (*initializer)());
+ 
+ inline bool Snappy_Compress(const char* input, size_t length,
+                             ::std::string* output) {
+-#ifdef SNAPPY
++#ifdef HAVE_SNAPPY
+   output->resize(snappy::MaxCompressedLength(length));
+   size_t outlen;
+   snappy::RawCompress(input, length, &(*output)[0], &outlen);
+   output->resize(outlen);
+   return true;
+-#endif
++#endif  // defined(HAVE_SNAPPY)
+ 
+   return false;
+ }
+ 
+ inline bool Snappy_GetUncompressedLength(const char* input, size_t length,
+                                          size_t* result) {
+-#ifdef SNAPPY
++#ifdef HAVE_SNAPPY
+   return snappy::GetUncompressedLength(input, length, result);
+ #else
+   return false;
+-#endif
++#endif  // defined(HAVE_SNAPPY)
+ }
+ 
+ inline bool Snappy_Uncompress(const char* input, size_t length,
+                               char* output) {
+-#ifdef SNAPPY
++#ifdef HAVE_SNAPPY
+   return snappy::RawUncompress(input, length, output);
+ #else
+   return false;
+-#endif
++#endif  // defined(HAVE_SNAPPY)
+ }
+ 
+ inline bool GetHeapProfile(void (*func)(void*, const char*, int), void* arg) {
+
+From 5c39524f3639e6bf6ab49215152d24273e662986 Mon Sep 17 00:00:00 2001
+From: costan <costan@google.com>
+Date: Tue, 10 Oct 2017 06:05:17 -0700
+Subject: [PATCH 20/26] Replace SSE-optimized CRC32C in POSIX port with
+ external library.
+
+Maintaining a hardware-accelerated CRC32C implementation tailored for
+all modern platforms deserves a repository of its own. We extracted the
+implementation here into https://github.com/google/crc32c and improved
+it in that repository. This CL removes the SSE-optimized implementation
+from this codebase, and adds the ability to use the google/crc32c
+library, if it is present on the system.
+
+The benchmarks below show the performance impact of the change. In
+summary, open source builds that use the google/crc32c library can
+expect a 3x improvement in CRC32C throughput, whereas builds that do not
+use the library will see a 50% drop in CRC32C throughput. This
+translates in much smaller changes in overall leveldb performance.
+
+Baseline, MacBookPro13,3 with Core i7 6920HQ:
+LevelDB:    version 1.20
+Keys:       16 bytes each
+Values:     100 bytes each (50 bytes after compression)
+Entries:    1000000
+RawSize:    110.6 MB (estimated)
+FileSize:   62.9 MB (estimated)
+------------------------------------------------
+fillseq      :       3.064 micros/op;   36.1 MB/s
+fillsync     :      57.861 micros/op;    1.9 MB/s (1000 ops)
+fillrandom   :       3.887 micros/op;   28.5 MB/s
+overwrite    :       4.140 micros/op;   26.7 MB/s
+readrandom   :       7.433 micros/op; (1000000 of 1000000 found)
+readrandom   :       6.825 micros/op; (1000000 of 1000000 found)
+readseq      :       0.244 micros/op;  453.4 MB/s
+readreverse  :       0.387 micros/op;  285.8 MB/s
+compact      :  449707.000 micros/op;
+readrandom   :       4.196 micros/op; (1000000 of 1000000 found)
+readseq      :       0.228 micros/op;  485.8 MB/s
+readreverse  :       0.320 micros/op;  345.2 MB/s
+fill100K     :     562.556 micros/op;  169.6 MB/s (1000 ops)
+crc32c       :       0.768 micros/op; 5085.0 MB/s (4K per op)
+snappycomp   :       4.220 micros/op;  925.7 MB/s (output: 55.1%)
+snappyuncomp :       0.635 micros/op; 6155.7 MB/s
+acquireload  :      13.054 micros/op; (each op is 1000 loads)
+
+New with crc32c, MacBookPro13,3 with Core i7 6920HQ:
+LevelDB:    version 1.20
+Keys:       16 bytes each
+Values:     100 bytes each (50 bytes after compression)
+Entries:    1000000
+RawSize:    110.6 MB (estimated)
+FileSize:   62.9 MB (estimated)
+------------------------------------------------
+fillseq      :       2.820 micros/op;   39.2 MB/s
+fillsync     :      51.988 micros/op;    2.1 MB/s (1000 ops)
+fillrandom   :       3.747 micros/op;   29.5 MB/s
+overwrite    :       4.047 micros/op;   27.3 MB/s
+readrandom   :       7.287 micros/op; (1000000 of 1000000 found)
+readrandom   :       6.927 micros/op; (1000000 of 1000000 found)
+readseq      :       0.253 micros/op;  437.5 MB/s
+readreverse  :       0.411 micros/op;  269.2 MB/s
+compact      :  440405.000 micros/op;
+readrandom   :       4.159 micros/op; (1000000 of 1000000 found)
+readseq      :       0.230 micros/op;  481.1 MB/s
+readreverse  :       0.320 micros/op;  345.9 MB/s
+fill100K     :     558.222 micros/op;  170.9 MB/s (1000 ops)
+crc32c       :       0.214 micros/op; 18263.5 MB/s (4K per op)
+snappycomp   :       4.471 micros/op;  873.7 MB/s (output: 55.1%)
+snappyuncomp :       0.833 micros/op; 4688.5 MB/s
+acquireload  :      13.289 micros/op; (each op is 1000 loads)
+
+New without crc32c, MacBookPro13,3 with Core i7 6920HQ
+LevelDB:    version 1.20
+Keys:       16 bytes each
+Values:     100 bytes each (50 bytes after compression)
+Entries:    1000000
+RawSize:    110.6 MB (estimated)
+FileSize:   62.9 MB (estimated)
+------------------------------------------------
+fillseq      :       3.094 micros/op;   35.8 MB/s
+fillsync     :      52.160 micros/op;    2.1 MB/s (1000 ops)
+fillrandom   :       4.090 micros/op;   27.0 MB/s
+overwrite    :       4.006 micros/op;   27.6 MB/s
+readrandom   :       6.584 micros/op; (1000000 of 1000000 found)
+readrandom   :       6.676 micros/op; (1000000 of 1000000 found)
+readseq      :       0.280 micros/op;  395.2 MB/s
+readreverse  :       0.391 micros/op;  283.2 MB/s
+compact      :  433911.000 micros/op;
+readrandom   :       4.261 micros/op; (1000000 of 1000000 found)
+readseq      :       0.251 micros/op;  440.5 MB/s
+readreverse  :       0.356 micros/op;  310.9 MB/s
+fill100K     :     584.023 micros/op;  163.3 MB/s (1000 ops)
+crc32c       :       1.384 micros/op; 2822.3 MB/s (4K per op)
+snappycomp   :       4.763 micros/op;  820.1 MB/s (output: 55.1%)
+snappyuncomp :       0.766 micros/op; 5098.6 MB/s
+acquireload  :      12.931 micros/op; (each op is 1000 loads)
+
+-------------
+Created by MOE: https://github.com/google/moe
+MOE_MIGRATED_REVID=171667771
+---
+ Makefile               |  10 +---
+ build_detect_platform  |  43 ++++++----------
+ port/port_posix.h      |  15 ++++--
+ port/port_posix_sse.cc | 133 -------------------------------------------------
+ 4 files changed, 29 insertions(+), 172 deletions(-)
+ delete mode 100644 port/port_posix_sse.cc
+
+diff --git a/deps/leveldb/leveldb-1.20/Makefile b/deps/leveldb/leveldb-1.20/Makefile
+index 4bd02a662..82dd84a9a 100644
+--- a/deps/leveldb/leveldb-1.20/Makefile
++++ b/deps/leveldb/leveldb-1.20/Makefile
+@@ -98,7 +98,7 @@ SHARED_MEMENVOBJECTS := $(addprefix $(SHARED_OUTDIR)/, $(MEMENV_SOURCES:.cc=.o))
+ 
+ TESTUTIL := $(STATIC_OUTDIR)/util/testutil.o
+ TESTHARNESS := $(STATIC_OUTDIR)/util/testharness.o $(TESTUTIL)
+-TEST_STATIC_OBJS := $(STATIC_OUTDIR)/port/port_posix.o $(STATIC_OUTDIR)/port/port_posix_sse.o $(STATIC_OUTDIR)/util/crc32c.o $(STATIC_OUTDIR)/util/histogram.o
++TEST_STATIC_OBJS := $(STATIC_OUTDIR)/port/port_posix.o $(STATIC_OUTDIR)/util/crc32c.o $(STATIC_OUTDIR)/util/histogram.o
+ 
+ STATIC_TESTOBJS := $(addprefix $(STATIC_OUTDIR)/, $(addsuffix .o, $(TESTS)))
+ STATIC_UTILOBJS := $(addprefix $(STATIC_OUTDIR)/, $(addsuffix .o, $(UTILS)))
+@@ -425,10 +425,4 @@ $(SHARED_OUTDIR)/%.o: %.cc
+ 	$(CXX) $(CXXFLAGS) $(SHARED_BUILD_CXXFLAGS) $(PLATFORM_SHARED_CFLAGS) -c $< -o $@
+ 
+ $(SHARED_OUTDIR)/%.o: %.c
+-	$(CC) $(CFLAGS) $(SHARED_BUILD_CXXFLAGS) $(PLATFORM_SHARED_CFLAGS) -c $< -o $@
+-
+-$(STATIC_OUTDIR)/port/port_posix_sse.o: port/port_posix_sse.cc
+-	$(CXX) $(CXXFLAGS) $(SHARED_BUILD_CXXFLAGS) $(PLATFORM_SSEFLAGS) -c $< -o $@
+-
+-$(SHARED_OUTDIR)/port/port_posix_sse.o: port/port_posix_sse.cc
+-	$(CXX) $(CXXFLAGS) $(SHARED_BUILD_CXXFLAGS) $(PLATFORM_SHARED_CFLAGS) $(PLATFORM_SSEFLAGS) -c $< -o $@
++	$(CC) $(CFLAGS) $(SHARED_BUILD_CXXFLAGS) $(PLATFORM_SHARED_CFLAGS) -c $< -o $@
+\ No newline at end of file
+diff --git a/deps/leveldb/leveldb-1.20/build_detect_platform b/deps/leveldb/leveldb-1.20/build_detect_platform
+index d1bb17e37..b7a859f83 100755
+--- a/deps/leveldb/leveldb-1.20/build_detect_platform
++++ b/deps/leveldb/leveldb-1.20/build_detect_platform
+@@ -22,6 +22,7 @@
+ #
+ #       -DLEVELDB_ATOMIC_PRESENT     if <atomic> is present
+ #       -DLEVELDB_PLATFORM_POSIX=1   for Posix-based platforms
++#       -DHAVE_CRC32C=1              if the CRC32C library is present
+ #       -DHAVE_SNAPPY=1              if the Snappy library is present
+ #
+ 
+@@ -63,7 +64,6 @@ PLATFORM_SHARED_EXT="so"
+ PLATFORM_SHARED_LDFLAGS="-shared -Wl,-soname -Wl,"
+ PLATFORM_SHARED_CFLAGS="-fPIC -fvisibility=hidden"
+ PLATFORM_SHARED_VERSIONED=true
+-PLATFORM_SSEFLAGS=
+ 
+ MEMCMP_FLAG=
+ if [ "$CXX" = "g++" ]; then
+@@ -78,7 +78,6 @@ case "$TARGET_OS" in
+         COMMON_FLAGS="$MEMCMP_FLAG -lpthread -DOS_LINUX -DCYGWIN"
+         PLATFORM_LDFLAGS="-lpthread"
+         PORT_FILE=port/port_posix.cc
+-        PORT_SSE_FILE=port/port_posix_sse.cc
+         ;;
+     Darwin)
+         PLATFORM=OS_MACOSX
+@@ -87,56 +86,48 @@ case "$TARGET_OS" in
+         [ -z "$INSTALL_PATH" ] && INSTALL_PATH=`pwd`
+         PLATFORM_SHARED_LDFLAGS="-dynamiclib -install_name $INSTALL_PATH/"
+         PORT_FILE=port/port_posix.cc
+-        PORT_SSE_FILE=port/port_posix_sse.cc
+         ;;
+     Linux)
+         PLATFORM=OS_LINUX
+         COMMON_FLAGS="$MEMCMP_FLAG -pthread -DOS_LINUX"
+         PLATFORM_LDFLAGS="-pthread"
+         PORT_FILE=port/port_posix.cc
+-        PORT_SSE_FILE=port/port_posix_sse.cc
+         ;;
+     SunOS)
+         PLATFORM=OS_SOLARIS
+         COMMON_FLAGS="$MEMCMP_FLAG -D_REENTRANT -DOS_SOLARIS"
+         PLATFORM_LIBS="-lpthread -lrt"
+         PORT_FILE=port/port_posix.cc
+-        PORT_SSE_FILE=port/port_posix_sse.cc
+         ;;
+     FreeBSD)
+         PLATFORM=OS_FREEBSD
+         COMMON_FLAGS="$MEMCMP_FLAG -D_REENTRANT -DOS_FREEBSD"
+         PLATFORM_LIBS="-lpthread"
+         PORT_FILE=port/port_posix.cc
+-        PORT_SSE_FILE=port/port_posix_sse.cc
+         ;;
+     NetBSD)
+         PLATFORM=OS_NETBSD
+         COMMON_FLAGS="$MEMCMP_FLAG -D_REENTRANT -DOS_NETBSD"
+         PLATFORM_LIBS="-lpthread -lgcc_s"
+         PORT_FILE=port/port_posix.cc
+-        PORT_SSE_FILE=port/port_posix_sse.cc
+         ;;
+     OpenBSD)
+         PLATFORM=OS_OPENBSD
+         COMMON_FLAGS="$MEMCMP_FLAG -D_REENTRANT -DOS_OPENBSD"
+         PLATFORM_LDFLAGS="-pthread"
+         PORT_FILE=port/port_posix.cc
+-        PORT_SSE_FILE=port/port_posix_sse.cc
+         ;;
+     DragonFly)
+         PLATFORM=OS_DRAGONFLYBSD
+         COMMON_FLAGS="$MEMCMP_FLAG -D_REENTRANT -DOS_DRAGONFLYBSD"
+         PLATFORM_LIBS="-lpthread"
+         PORT_FILE=port/port_posix.cc
+-        PORT_SSE_FILE=port/port_posix_sse.cc
+         ;;
+     OS_ANDROID_CROSSCOMPILE)
+         PLATFORM=OS_ANDROID
+         COMMON_FLAGS="$MEMCMP_FLAG -D_REENTRANT -DOS_ANDROID -DLEVELDB_PLATFORM_POSIX=1"
+         PLATFORM_LDFLAGS=""  # All pthread features are in the Android C library
+         PORT_FILE=port/port_posix.cc
+-        PORT_SSE_FILE=port/port_posix_sse.cc
+         CROSS_COMPILE=true
+         ;;
+     HP-UX)
+@@ -144,7 +135,6 @@ case "$TARGET_OS" in
+         COMMON_FLAGS="$MEMCMP_FLAG -D_REENTRANT -DOS_HPUX"
+         PLATFORM_LDFLAGS="-pthread"
+         PORT_FILE=port/port_posix.cc
+-        PORT_SSE_FILE=port/port_posix_sse.cc
+         # man ld: +h internal_name
+         PLATFORM_SHARED_LDFLAGS="-shared -Wl,+h -Wl,"
+         ;;
+@@ -153,7 +143,6 @@ case "$TARGET_OS" in
+         COMMON_FLAGS="$MEMCMP_FLAG"
+         [ -z "$INSTALL_PATH" ] && INSTALL_PATH=`pwd`
+         PORT_FILE=port/port_posix.cc
+-        PORT_SSE_FILE=port/port_posix_sse.cc
+         PLATFORM_SHARED_EXT=
+         PLATFORM_SHARED_LDFLAGS=
+         PLATFORM_SHARED_CFLAGS=
+@@ -180,7 +169,7 @@ set +f # re-enable globbing
+ 
+ # The sources consist of the portable files, plus the platform-specific port
+ # file.
+-echo "SOURCES=$PORTABLE_FILES $PORT_FILE $PORT_SSE_FILE" >> $OUTPUT
++echo "SOURCES=$PORTABLE_FILES $PORT_FILE" >> $OUTPUT
+ echo "MEMENV_SOURCES=helpers/memenv/memenv.cc" >> $OUTPUT
+ 
+ if [ "$CROSS_COMPILE" = "true" ]; then
+@@ -202,8 +191,20 @@ EOF
+         COMMON_FLAGS="$COMMON_FLAGS -DLEVELDB_PLATFORM_POSIX=1"
+     fi
+ 
++    # Test whether CRC32C library is installed
++    # https://github.com/google/crc32c
++    $CXX $CXXFLAGS -x c++ - -o $CXXOUTPUT 2>/dev/null  <<EOF
++      #include <crc32c/crc32c.h>
++      int main() {}
++EOF
++    if [ "$?" = 0 ]; then
++        COMMON_FLAGS="$COMMON_FLAGS -DHAVE_CRC32C=1"
++        PLATFORM_LIBS="$PLATFORM_LIBS -lcrc32c"
++    fi
++
++
+     # Test whether Snappy library is installed
+-    # http://code.google.com/p/snappy/
++    # https://github.com/google/snappy
+     $CXX $CXXFLAGS -x c++ - -o $CXXOUTPUT 2>/dev/null  <<EOF
+       #include <snappy.h>
+       int main() {}
+@@ -223,22 +224,9 @@ EOF
+ 
+     rm -f $CXXOUTPUT 2>/dev/null
+ 
+-    # Test if gcc SSE 4.2 is supported
+-    $CXX $CXXFLAGS -x c++ - -o $CXXOUTPUT -msse4.2 2>/dev/null  <<EOF
+-      int main() {}
+-EOF
+-    if [ "$?" = 0 ]; then
+-        PLATFORM_SSEFLAGS="-msse4.2"
+-    fi
+-
+     rm -f $CXXOUTPUT 2>/dev/null
+ fi
+ 
+-# Use the SSE 4.2 CRC32C intrinsics iff runtime checks indicate compiler supports them.
+-if [ -n "$PLATFORM_SSEFLAGS" ]; then
+-    PLATFORM_SSEFLAGS="$PLATFORM_SSEFLAGS -DLEVELDB_PLATFORM_POSIX_SSE"
+-fi
+-
+ PLATFORM_CCFLAGS="$PLATFORM_CCFLAGS $COMMON_FLAGS"
+ PLATFORM_CXXFLAGS="$PLATFORM_CXXFLAGS $COMMON_FLAGS"
+ 
+@@ -249,7 +237,6 @@ echo "PLATFORM_LDFLAGS=$PLATFORM_LDFLAGS" >> $OUTPUT
+ echo "PLATFORM_LIBS=$PLATFORM_LIBS" >> $OUTPUT
+ echo "PLATFORM_CCFLAGS=$PLATFORM_CCFLAGS" >> $OUTPUT
+ echo "PLATFORM_CXXFLAGS=$PLATFORM_CXXFLAGS" >> $OUTPUT
+-echo "PLATFORM_SSEFLAGS=$PLATFORM_SSEFLAGS" >> $OUTPUT
+ echo "PLATFORM_SHARED_CFLAGS=$PLATFORM_SHARED_CFLAGS" >> $OUTPUT
+ echo "PLATFORM_SHARED_EXT=$PLATFORM_SHARED_EXT" >> $OUTPUT
+ echo "PLATFORM_SHARED_LDFLAGS=$PLATFORM_SHARED_LDFLAGS" >> $OUTPUT
+diff --git a/deps/leveldb/leveldb-1.20/port/port_posix.h b/deps/leveldb/leveldb-1.20/port/port_posix.h
+index 2bc5223d5..2a30be3a1 100644
+--- a/deps/leveldb/leveldb-1.20/port/port_posix.h
++++ b/deps/leveldb/leveldb-1.20/port/port_posix.h
+@@ -39,6 +39,9 @@
+ #endif
+ 
+ #include <pthread.h>
++#if defined(HAVE_CRC32C)
++#include <crc32c/crc32c.h>
++#endif  // defined(HAVE_CRC32C)
+ #ifdef HAVE_SNAPPY
+ #include <snappy.h>
+ #endif  // defined(HAVE_SNAPPY)
+@@ -139,9 +142,15 @@ inline bool GetHeapProfile(void (*func)(void*, const char*, int), void* arg) {
+   return false;
+ }
+ 
+-uint32_t AcceleratedCRC32C(uint32_t crc, const char* buf, size_t size);
++inline uint32_t AcceleratedCRC32C(uint32_t crc, const char* buf, size_t size) {
++#if defined(HAVE_CRC32C)
++  return ::crc32c::Extend(crc, reinterpret_cast<const uint8_t*>(buf), size);
++#else
++  return 0;
++#endif  // defined(HAVE_CRC32C)
++}
+ 
+-} // namespace port
+-} // namespace leveldb
++}  // namespace port
++}  // namespace leveldb
+ 
+ #endif  // STORAGE_LEVELDB_PORT_PORT_POSIX_H_
+diff --git a/deps/leveldb/leveldb-1.20/port/port_posix_sse.cc b/deps/leveldb/leveldb-1.20/port/port_posix_sse.cc
+deleted file mode 100644
+index 08d9aee1e..000000000
+--- a/deps/leveldb/leveldb-1.20/port/port_posix_sse.cc
++++ /dev/null
+@@ -1,133 +0,0 @@
+-// Copyright 2016 The LevelDB Authors. All rights reserved.
+-// Use of this source code is governed by a BSD-style license that can be
+-// found in the LICENSE file. See the AUTHORS file for names of contributors.
+-//
+-// A portable implementation of crc32c, optimized to handle
+-// four bytes at a time.
+-//
+-// In a separate source file to allow this accelerated CRC32C function to be
+-// compiled with the appropriate compiler flags to enable x86 SSE 4.2
+-// instructions.
+-
+-#include <stdint.h>
+-#include <string.h>
+-#include "port/port.h"
+-
+-#if defined(LEVELDB_PLATFORM_POSIX_SSE)
+-
+-#if defined(_MSC_VER)
+-#include <intrin.h>
+-#elif defined(__GNUC__) && defined(__SSE4_2__)
+-#include <nmmintrin.h>
+-#include <cpuid.h>
+-#endif
+-
+-#endif  // defined(LEVELDB_PLATFORM_POSIX_SSE)
+-
+-namespace leveldb {
+-namespace port {
+-
+-#if defined(LEVELDB_PLATFORM_POSIX_SSE)
+-
+-// Used to fetch a naturally-aligned 32-bit word in little endian byte-order
+-static inline uint32_t LE_LOAD32(const uint8_t *p) {
+-  // SSE is x86 only, so ensured that |p| is always little-endian.
+-  uint32_t word;
+-  memcpy(&word, p, sizeof(word));
+-  return word;
+-}
+-
+-#if defined(_M_X64) || defined(__x86_64__)  // LE_LOAD64 is only used on x64.
+-
+-// Used to fetch a naturally-aligned 64-bit word in little endian byte-order
+-static inline uint64_t LE_LOAD64(const uint8_t *p) {
+-  uint64_t dword;
+-  memcpy(&dword, p, sizeof(dword));
+-  return dword;
+-}
+-
+-#endif  // defined(_M_X64) || defined(__x86_64__)
+-
+-static inline bool HaveSSE42() {
+-#if defined(_MSC_VER)
+-  int cpu_info[4];
+-  __cpuid(cpu_info, 1);
+-  return (cpu_info[2] & (1 << 20)) != 0;
+-#elif defined(__GNUC__)
+-  unsigned int eax, ebx, ecx, edx;
+-  __get_cpuid(1, &eax, &ebx, &ecx, &edx);
+-  return (ecx & (1 << 20)) != 0;
+-#else
+-  return false;
+-#endif
+-}
+-
+-#endif  // defined(LEVELDB_PLATFORM_POSIX_SSE)
+-
+-// For further improvements see Intel publication at:
+-// http://download.intel.com/design/intarch/papers/323405.pdf
+-uint32_t AcceleratedCRC32C(uint32_t crc, const char* buf, size_t size) {
+-#if !defined(LEVELDB_PLATFORM_POSIX_SSE)
+-  return 0;
+-#else
+-  static bool have = HaveSSE42();
+-  if (!have) {
+-    return 0;
+-  }
+-
+-  const uint8_t *p = reinterpret_cast<const uint8_t *>(buf);
+-  const uint8_t *e = p + size;
+-  uint32_t l = crc ^ 0xffffffffu;
+-
+-#define STEP1 do {                              \
+-    l = _mm_crc32_u8(l, *p++);                  \
+-} while (0)
+-#define STEP4 do {                              \
+-    l = _mm_crc32_u32(l, LE_LOAD32(p));         \
+-    p += 4;                                     \
+-} while (0)
+-#define STEP8 do {                              \
+-    l = _mm_crc32_u64(l, LE_LOAD64(p));         \
+-    p += 8;                                     \
+-} while (0)
+-
+-  if (size > 16) {
+-    // Point x at first 8-byte aligned byte in string. This must be inside the
+-    // string, due to the size check above.
+-    const uintptr_t pval = reinterpret_cast<uintptr_t>(p);
+-    const uint8_t* x = reinterpret_cast<const uint8_t*>(((pval + 7) >> 3) << 3);
+-    // Process bytes until p is 8-byte aligned.
+-    while (p != x) {
+-      STEP1;
+-    }
+-
+-    // _mm_crc32_u64 is only available on x64.
+-#if defined(_M_X64) || defined(__x86_64__)
+-    // Process 8 bytes at a time
+-    while ((e-p) >= 8) {
+-      STEP8;
+-    }
+-    // Process 4 bytes at a time
+-    if ((e-p) >= 4) {
+-      STEP4;
+-    }
+-#else  // !(defined(_M_X64) || defined(__x86_64__))
+-    // Process 4 bytes at a time
+-    while ((e-p) >= 4) {
+-      STEP4;
+-    }
+-#endif  // defined(_M_X64) || defined(__x86_64__)
+-  }
+-  // Process the last few bytes
+-  while (p != e) {
+-    STEP1;
+-  }
+-#undef STEP8
+-#undef STEP4
+-#undef STEP1
+-  return l ^ 0xffffffffu;
+-#endif  // defined(LEVELDB_PLATFORM_POSIX_SSE)
+-}
+-
+-}  // namespace port
+-}  // namespace leveldb
+
+From 23162ca1c6d891a9c5fe0e0fab1193cd54ed1b4f Mon Sep 17 00:00:00 2001
+From: costan <costan@google.com>
+Date: Tue, 10 Oct 2017 11:29:00 -0700
+Subject: [PATCH 21/26] Fix typo (forgotten reference operator) in test.
+
+-------------
+Created by MOE: https://github.com/google/moe
+MOE_MIGRATED_REVID=171708408
+---
+ db/fault_injection_test.cc | 2 +-
+ 1 file changed, 1 insertion(+), 1 deletion(-)
+
+diff --git a/deps/leveldb/leveldb-1.20/db/fault_injection_test.cc b/deps/leveldb/leveldb-1.20/db/fault_injection_test.cc
+index 875dfe81e..f8b24405a 100644
+--- a/deps/leveldb/leveldb-1.20/db/fault_injection_test.cc
++++ b/deps/leveldb/leveldb-1.20/db/fault_injection_test.cc
+@@ -34,7 +34,7 @@ class FaultInjectionTestEnv;
+ namespace {
+ 
+ // Assume a filename, and not a directory name like "/foo/bar/"
+-static std::string GetDirName(const std::string filename) {
++static std::string GetDirName(const std::string& filename) {
+   size_t found = filename.find_last_of("/\\");
+   if (found == std::string::npos) {
+     return "";
+
+From 0509414f858ae7c7225e29f3659a709afb324355 Mon Sep 17 00:00:00 2001
+From: cmumford <cmumford@google.com>
+Date: Tue, 17 Oct 2017 13:05:47 -0700
+Subject: [PATCH 22/26] leveldb::DestroyDB will now delete empty directories.
+
+Env's that filtered out dot files ("." and "..") would return an
+empty vector of children causing DestroyDB to do nothing. This fixes
+https://github.com/google/leveldb/issues/215
+
+-------------
+Created by MOE: https://github.com/google/moe
+MOE_MIGRATED_REVID=172501335
+---
+ db/db_impl.cc        |  8 ++---
+ db/db_test.cc        | 82 ++++++++++++++++++++++++++++++++++++++++++++++++++++
+ include/leveldb/db.h |  3 ++
+ 3 files changed, 89 insertions(+), 4 deletions(-)
+
+diff --git a/deps/leveldb/leveldb-1.20/db/db_impl.cc b/deps/leveldb/leveldb-1.20/db/db_impl.cc
+index f43ad7679..a9044c261 100644
+--- a/deps/leveldb/leveldb-1.20/db/db_impl.cc
++++ b/deps/leveldb/leveldb-1.20/db/db_impl.cc
+@@ -1537,15 +1537,15 @@ Snapshot::~Snapshot() {
+ Status DestroyDB(const std::string& dbname, const Options& options) {
+   Env* env = options.env;
+   std::vector<std::string> filenames;
+-  // Ignore error in case directory does not exist
+-  env->GetChildren(dbname, &filenames);
+-  if (filenames.empty()) {
++  Status result = env->GetChildren(dbname, &filenames);
++  if (!result.ok()) {
++    // Ignore error in case directory does not exist
+     return Status::OK();
+   }
+ 
+   FileLock* lock;
+   const std::string lockname = LockFileName(dbname);
+-  Status result = env->LockFile(lockname, &lock);
++  result = env->LockFile(lockname, &lock);
+   if (result.ok()) {
+     uint64_t number;
+     FileType type;
+diff --git a/deps/leveldb/leveldb-1.20/db/db_test.cc b/deps/leveldb/leveldb-1.20/db/db_test.cc
+index edc3916e8..c81811331 100644
+--- a/deps/leveldb/leveldb-1.20/db/db_test.cc
++++ b/deps/leveldb/leveldb-1.20/db/db_test.cc
+@@ -61,6 +61,36 @@ void DelayMilliseconds(int millis) {
+ }
+ }
+ 
++// Test Env to override default Env behavior for testing.
++class TestEnv : public EnvWrapper {
++ public:
++  explicit TestEnv(Env* base) : EnvWrapper(base), ignore_dot_files_(false) {}
++
++  void SetIgnoreDotFiles(bool ignored) { ignore_dot_files_ = ignored; }
++
++  Status GetChildren(const std::string& dir,
++                     std::vector<std::string>* result) override {
++    Status s = target()->GetChildren(dir, result);
++    if (!s.ok() || !ignore_dot_files_) {
++      return s;
++    }
++
++    std::vector<std::string>::iterator it = result->begin();
++    while (it != result->end()) {
++      if ((*it == ".") || (*it == "..")) {
++        it = result->erase(it);
++      } else {
++        ++it;
++      }
++    }
++
++    return s;
++  }
++
++ private:
++  bool ignore_dot_files_;
++};
++
+ // Special Env used to delay background operations
+ class SpecialEnv : public EnvWrapper {
+  public:
+@@ -1561,6 +1591,58 @@ TEST(DBTest, DBOpen_Options) {
+   db = NULL;
+ }
+ 
++TEST(DBTest, DestroyEmptyDir) {
++  std::string dbname = test::TmpDir() + "/db_empty_dir";
++  TestEnv env(Env::Default());
++  env.DeleteDir(dbname);
++  ASSERT_TRUE(!env.FileExists(dbname));
++
++  Options opts;
++  opts.env = &env;
++
++  ASSERT_OK(env.CreateDir(dbname));
++  ASSERT_TRUE(env.FileExists(dbname));
++  std::vector<std::string> children;
++  ASSERT_OK(env.GetChildren(dbname, &children));
++  // The POSIX env does not filter out '.' and '..' special files.
++  ASSERT_EQ(2, children.size());
++  ASSERT_OK(DestroyDB(dbname, opts));
++  ASSERT_TRUE(!env.FileExists(dbname));
++
++  // Should also be destroyed if Env is filtering out dot files.
++  env.SetIgnoreDotFiles(true);
++  ASSERT_OK(env.CreateDir(dbname));
++  ASSERT_TRUE(env.FileExists(dbname));
++  ASSERT_OK(env.GetChildren(dbname, &children));
++  ASSERT_EQ(0, children.size());
++  ASSERT_OK(DestroyDB(dbname, opts));
++  ASSERT_TRUE(!env.FileExists(dbname));
++}
++
++TEST(DBTest, DestroyOpenDB) {
++  std::string dbname = test::TmpDir() + "/open_db_dir";
++  env_->DeleteDir(dbname);
++  ASSERT_TRUE(!env_->FileExists(dbname));
++
++  Options opts;
++  opts.create_if_missing = true;
++  DB* db = NULL;
++  ASSERT_OK(DB::Open(opts, dbname, &db));
++  ASSERT_TRUE(db != NULL);
++
++  // Must fail to destroy an open db.
++  ASSERT_TRUE(env_->FileExists(dbname));
++  ASSERT_TRUE(!DestroyDB(dbname, Options()).ok());
++  ASSERT_TRUE(env_->FileExists(dbname));
++
++  delete db;
++  db = NULL;
++
++  // Should succeed destroying a closed db.
++  ASSERT_OK(DestroyDB(dbname, Options()));
++  ASSERT_TRUE(!env_->FileExists(dbname));
++}
++
+ TEST(DBTest, Locking) {
+   DB* db2 = NULL;
+   Status s = DB::Open(CurrentOptions(), dbname_, &db2);
+diff --git a/deps/leveldb/leveldb-1.20/include/leveldb/db.h b/deps/leveldb/leveldb-1.20/include/leveldb/db.h
+index 9a18c92f1..e99f45c1e 100644
+--- a/deps/leveldb/leveldb-1.20/include/leveldb/db.h
++++ b/deps/leveldb/leveldb-1.20/include/leveldb/db.h
+@@ -151,6 +151,9 @@ class LEVELDB_EXPORT DB {
+ 
+ // Destroy the contents of the specified database.
+ // Be very careful using this method.
++//
++// Note: For backwards compatibility, if DestroyDB is unable to list the
++// database files, Status::OK() will still be returned masking this failure.
+ LEVELDB_EXPORT Status DestroyDB(const std::string& name,
+                                 const Options& options);
+ 
+
+From 3da4d8b9899257386aeb5ffa345a6477c62ff7bf Mon Sep 17 00:00:00 2001
+From: cmumford <cmumford@google.com>
+Date: Thu, 19 Oct 2017 10:33:42 -0700
+Subject: [PATCH 23/26] Deleted unused assignments in Reader.
+
+Deleted two unused assignments:
+
+1. offset_in_block in Reader::SkipToInitialBlock().
+2. in_fragmented_record in Reader::ReadRecord().
+
+Reasons for the change:
+1. offset_in_block is not read again after the if condition.
+2. The kFullRecordType switch branch returns, so
+   in_fragmented_record isn't read again.
+3. The kFirstType switch branch sets in_fragmented_record to
+   true after the if, so the write in the if is ignored.
+
+Change contributed by @C0deAi on GitHub.
+
+This fixes https://github.com/google/leveldb/issues/517
+
+-------------
+Created by MOE: https://github.com/google/moe
+MOE_MIGRATED_REVID=172763897
+---
+ db/log_reader.cc | 11 +++--------
+ 1 file changed, 3 insertions(+), 8 deletions(-)
+
+diff --git a/deps/leveldb/leveldb-1.20/db/log_reader.cc b/deps/leveldb/leveldb-1.20/db/log_reader.cc
+index a6d304545..48ae863e5 100644
+--- a/deps/leveldb/leveldb-1.20/db/log_reader.cc
++++ b/deps/leveldb/leveldb-1.20/db/log_reader.cc
+@@ -34,12 +34,11 @@ Reader::~Reader() {
+ }
+ 
+ bool Reader::SkipToInitialBlock() {
+-  size_t offset_in_block = initial_offset_ % kBlockSize;
++  const size_t offset_in_block = initial_offset_ % kBlockSize;
+   uint64_t block_start_location = initial_offset_ - offset_in_block;
+ 
+   // Don't search a block if we'd be in the trailer
+   if (offset_in_block > kBlockSize - 6) {
+-    offset_in_block = 0;
+     block_start_location += kBlockSize;
+   }
+ 
+@@ -99,9 +98,7 @@ bool Reader::ReadRecord(Slice* record, std::string* scratch) {
+           // it could emit an empty kFirstType record at the tail end
+           // of a block followed by a kFullType or kFirstType record
+           // at the beginning of the next block.
+-          if (scratch->empty()) {
+-            in_fragmented_record = false;
+-          } else {
++          if (!scratch->empty()) {
+             ReportCorruption(scratch->size(), "partial record without end(1)");
+           }
+         }
+@@ -117,9 +114,7 @@ bool Reader::ReadRecord(Slice* record, std::string* scratch) {
+           // it could emit an empty kFirstType record at the tail end
+           // of a block followed by a kFullType or kFirstType record
+           // at the beginning of the next block.
+-          if (scratch->empty()) {
+-            in_fragmented_record = false;
+-          } else {
++          if (!scratch->empty()) {
+             ReportCorruption(scratch->size(), "partial record without end(2)");
+           }
+         }
+
+From b5d4a22e64c7a6615b412f464026c808b58b1d34 Mon Sep 17 00:00:00 2001
+From: cmumford <cmumford@google.com>
+Date: Mon, 23 Oct 2017 16:28:45 -0700
+Subject: [PATCH 24/26] Fixed style guide link in CONTRIBUTING.md
+
+The C++ style guide URL was wrong.
+
+This fixes issue #394. Reported by GitHub user @Loki-Astari.
+
+-------------
+Created by MOE: https://github.com/google/moe
+MOE_MIGRATED_REVID=173188573
+---
+ CONTRIBUTING.md | 4 ++--
+ 1 file changed, 2 insertions(+), 2 deletions(-)
+
+diff --git a/deps/leveldb/leveldb-1.20/CONTRIBUTING.md b/deps/leveldb/leveldb-1.20/CONTRIBUTING.md
+index cd600ff46..a74572a59 100644
+--- a/deps/leveldb/leveldb-1.20/CONTRIBUTING.md
++++ b/deps/leveldb/leveldb-1.20/CONTRIBUTING.md
+@@ -31,6 +31,6 @@ the CLA.
+ 
+ ## Writing Code ##
+ 
+-If your contribution contains code, please make sure that it follows 
+-[the style guide](http://google-styleguide.googlecode.com/svn/trunk/cppguide.xml).
++If your contribution contains code, please make sure that it follows
++[the style guide](http://google.github.io/styleguide/cppguide.html).
+ Otherwise we will have to ask you to make changes, and that's no fun for anyone.
+
+From 47cb9e2a211e1d7157078ba7bab536beb29e56dc Mon Sep 17 00:00:00 2001
+From: cmumford <cmumford@google.com>
+Date: Wed, 25 Oct 2017 16:13:51 -0700
+Subject: [PATCH 25/26] Add leveldb_options_set_max_file_size to the C API.
+
+When the max file size option was added in CL 134391640 the C API
+was not modified to support this.
+
+This change was contributed by GitHub user @olt and fixes issue #439.
+
+-------------
+Created by MOE: https://github.com/google/moe
+MOE_MIGRATED_REVID=173466388
+---
+ db/c.cc             | 4 ++++
+ db/c_test.c         | 1 +
+ include/leveldb/c.h | 2 ++
+ 3 files changed, 7 insertions(+)
+
+diff --git a/deps/leveldb/leveldb-1.20/db/c.cc b/deps/leveldb/leveldb-1.20/db/c.cc
+index 08ff0ad90..d2423859e 100644
+--- a/deps/leveldb/leveldb-1.20/db/c.cc
++++ b/deps/leveldb/leveldb-1.20/db/c.cc
+@@ -446,6 +446,10 @@ void leveldb_options_set_block_restart_interval(leveldb_options_t* opt, int n) {
+   opt->rep.block_restart_interval = n;
+ }
+ 
++void leveldb_options_set_max_file_size(leveldb_options_t* opt, size_t s) {
++  opt->rep.max_file_size = s;
++}
++
+ void leveldb_options_set_compression(leveldb_options_t* opt, int t) {
+   opt->rep.compression = static_cast<CompressionType>(t);
+ }
+diff --git a/deps/leveldb/leveldb-1.20/db/c_test.c b/deps/leveldb/leveldb-1.20/db/c_test.c
+index 7cd5ee020..4a141513b 100644
+--- a/deps/leveldb/leveldb-1.20/db/c_test.c
++++ b/deps/leveldb/leveldb-1.20/db/c_test.c
+@@ -189,6 +189,7 @@ int main(int argc, char** argv) {
+   leveldb_options_set_max_open_files(options, 10);
+   leveldb_options_set_block_size(options, 1024);
+   leveldb_options_set_block_restart_interval(options, 8);
++  leveldb_options_set_max_file_size(options, 3 << 20);
+   leveldb_options_set_compression(options, leveldb_no_compression);
+ 
+   roptions = leveldb_readoptions_create();
+diff --git a/deps/leveldb/leveldb-1.20/include/leveldb/c.h b/deps/leveldb/leveldb-1.20/include/leveldb/c.h
+index 7ac8121d5..dc6f25533 100644
+--- a/deps/leveldb/leveldb-1.20/include/leveldb/c.h
++++ b/deps/leveldb/leveldb-1.20/include/leveldb/c.h
+@@ -184,6 +184,8 @@ LEVELDB_EXPORT void leveldb_options_set_cache(leveldb_options_t*,
+ LEVELDB_EXPORT void leveldb_options_set_block_size(leveldb_options_t*, size_t);
+ LEVELDB_EXPORT void leveldb_options_set_block_restart_interval(
+     leveldb_options_t*, int);
++LEVELDB_EXPORT void leveldb_options_set_max_file_size(leveldb_options_t*,
++                                                      size_t);
+ 
+ enum {
+   leveldb_no_compression = 0,
+
+From 41172a24016bc29fc795ed504737392587f54e3d Mon Sep 17 00:00:00 2001
+From: costan <costan@google.com>
+Date: Tue, 13 Feb 2018 22:31:50 -0800
+Subject: [PATCH 26/26] Enable thread safety annotations in open source
+ version.
+
+The thread safety annotations used by leveldb got opensourced in Abseil
+[1]. This CL replaces leveldb's stubs with the relevant definitions from
+[1], and adds annotations to the Mutex classes in the POSIX port.
+
+[1] https://github.com/abseil/abseil-cpp/blob/master/absl/base/thread_annotations.h
+---
+ build_detect_platform     | 19 +++++++++--
+ port/port_example.h       | 10 +++---
+ port/port_posix.h         |  9 +++---
+ port/thread_annotations.h | 81 ++++++++++++++++++++++++++++++++++++++---------
+ 4 files changed, 94 insertions(+), 25 deletions(-)
+
+diff --git a/deps/leveldb/leveldb-1.20/build_detect_platform b/deps/leveldb/leveldb-1.20/build_detect_platform
+index b7a859f83..07684299e 100755
+--- a/deps/leveldb/leveldb-1.20/build_detect_platform
++++ b/deps/leveldb/leveldb-1.20/build_detect_platform
+@@ -202,7 +202,6 @@ EOF
+         PLATFORM_LIBS="$PLATFORM_LIBS -lcrc32c"
+     fi
+ 
+-
+     # Test whether Snappy library is installed
+     # https://github.com/google/snappy
+     $CXX $CXXFLAGS -x c++ - -o $CXXOUTPUT 2>/dev/null  <<EOF
+@@ -222,7 +221,23 @@ EOF
+         PLATFORM_LIBS="$PLATFORM_LIBS -ltcmalloc"
+     fi
+ 
+-    rm -f $CXXOUTPUT 2>/dev/null
++    # Test whether -Wthread-safety is available. See
++    # https://clang.llvm.org/docs/ThreadSafetyAnalysis.html
++    # -Werror is necessary because unknown attributes only generate warnings.
++    $CXX $CXXFLAGS -Wthread-safety -Werror -x c++ - -o $CXXOUTPUT 2>/dev/null  <<EOF
++      struct __attribute__((lockable)) Lock {
++        void Acquire() __attribute__((exclusive_lock_function()));
++        void Release() __attribute__((unlock_function()));
++      };
++      struct ThreadSafeType {
++        Lock lock_;
++        int data_ __attribute__((guarded_by(lock_)));
++      };
++      int main() { return 0; }
++EOF
++    if [ "$?" = 0 ]; then
++        COMMON_FLAGS="$COMMON_FLAGS -Wthread-safety"
++    fi
+ 
+     rm -f $CXXOUTPUT 2>/dev/null
+ fi
+diff --git a/deps/leveldb/leveldb-1.20/port/port_example.h b/deps/leveldb/leveldb-1.20/port/port_example.h
+index 97bd669a5..b5190e613 100644
+--- a/deps/leveldb/leveldb-1.20/port/port_example.h
++++ b/deps/leveldb/leveldb-1.20/port/port_example.h
+@@ -10,6 +10,8 @@
+ #ifndef STORAGE_LEVELDB_PORT_PORT_EXAMPLE_H_
+ #define STORAGE_LEVELDB_PORT_PORT_EXAMPLE_H_
+ 
++#include "port/thread_annotations.h"
++
+ namespace leveldb {
+ namespace port {
+ 
+@@ -23,23 +25,23 @@ static const bool kLittleEndian = true /* or some other expression */;
+ // ------------------ Threading -------------------
+ 
+ // A Mutex represents an exclusive lock.
+-class Mutex {
++class LOCKABLE Mutex {
+  public:
+   Mutex();
+   ~Mutex();
+ 
+   // Lock the mutex.  Waits until other lockers have exited.
+   // Will deadlock if the mutex is already locked by this thread.
+-  void Lock();
++  void Lock() EXCLUSIVE_LOCK_FUNCTION();
+ 
+   // Unlock the mutex.
+   // REQUIRES: This mutex was locked by this thread.
+-  void Unlock();
++  void Unlock() UNLOCK_FUNCTION();
+ 
+   // Optionally crash if this thread does not hold this mutex.
+   // The implementation must be fast, especially if NDEBUG is
+   // defined.  The implementation is allowed to skip all checks.
+-  void AssertHeld();
++  void AssertHeld() ASSERT_EXCLUSIVE_LOCK();
+ };
+ 
+ class CondVar {
+diff --git a/deps/leveldb/leveldb-1.20/port/port_posix.h b/deps/leveldb/leveldb-1.20/port/port_posix.h
+index 2a30be3a1..d30f0f247 100644
+--- a/deps/leveldb/leveldb-1.20/port/port_posix.h
++++ b/deps/leveldb/leveldb-1.20/port/port_posix.h
+@@ -48,6 +48,7 @@
+ #include <stdint.h>
+ #include <string>
+ #include "port/atomic_pointer.h"
++#include "port/thread_annotations.h"
+ 
+ #ifndef PLATFORM_IS_LITTLE_ENDIAN
+ #define PLATFORM_IS_LITTLE_ENDIAN (__BYTE_ORDER == __LITTLE_ENDIAN)
+@@ -73,14 +74,14 @@ static const bool kLittleEndian = PLATFORM_IS_LITTLE_ENDIAN;
+ 
+ class CondVar;
+ 
+-class Mutex {
++class LOCKABLE Mutex {
+  public:
+   Mutex();
+   ~Mutex();
+ 
+-  void Lock();
+-  void Unlock();
+-  void AssertHeld() { }
++  void Lock() EXCLUSIVE_LOCK_FUNCTION();
++  void Unlock() UNLOCK_FUNCTION();
++  void AssertHeld() ASSERT_EXCLUSIVE_LOCK() { }
+ 
+  private:
+   friend class CondVar;
+diff --git a/deps/leveldb/leveldb-1.20/port/thread_annotations.h b/deps/leveldb/leveldb-1.20/port/thread_annotations.h
+index 9470ef587..b737c6901 100644
+--- a/deps/leveldb/leveldb-1.20/port/thread_annotations.h
++++ b/deps/leveldb/leveldb-1.20/port/thread_annotations.h
+@@ -5,56 +5,107 @@
+ #ifndef STORAGE_LEVELDB_PORT_THREAD_ANNOTATIONS_H_
+ #define STORAGE_LEVELDB_PORT_THREAD_ANNOTATIONS_H_
+ 
+-// Some environments provide custom macros to aid in static thread-safety
+-// analysis.  Provide empty definitions of such macros unless they are already
+-// defined.
++// Use Clang's thread safety analysis annotations when available. In other
++// environments, the macros receive empty definitions.
++// Usage documentation: https://clang.llvm.org/docs/ThreadSafetyAnalysis.html
++
++#if !defined(THREAD_ANNOTATION_ATTRIBUTE__)
++
++#if defined(__clang__)
++
++#define THREAD_ANNOTATION_ATTRIBUTE__(x)   __attribute__((x))
++#else
++#define THREAD_ANNOTATION_ATTRIBUTE__(x)   // no-op
++#endif
++
++#endif  // !defined(THREAD_ANNOTATION_ATTRIBUTE__)
++
++#ifndef GUARDED_BY
++#define GUARDED_BY(x) THREAD_ANNOTATION_ATTRIBUTE__(guarded_by(x))
++#endif
++
++#ifndef PT_GUARDED_BY
++#define PT_GUARDED_BY(x) THREAD_ANNOTATION_ATTRIBUTE__(pt_guarded_by(x))
++#endif
++
++#ifndef ACQUIRED_AFTER
++#define ACQUIRED_AFTER(...) \
++  THREAD_ANNOTATION_ATTRIBUTE__(acquired_after(__VA_ARGS__))
++#endif
++
++#ifndef ACQUIRED_BEFORE
++#define ACQUIRED_BEFORE(...) \
++  THREAD_ANNOTATION_ATTRIBUTE__(acquired_before(__VA_ARGS__))
++#endif
+ 
+ #ifndef EXCLUSIVE_LOCKS_REQUIRED
+-#define EXCLUSIVE_LOCKS_REQUIRED(...)
++#define EXCLUSIVE_LOCKS_REQUIRED(...) \
++  THREAD_ANNOTATION_ATTRIBUTE__(exclusive_locks_required(__VA_ARGS__))
+ #endif
+ 
+ #ifndef SHARED_LOCKS_REQUIRED
+-#define SHARED_LOCKS_REQUIRED(...)
++#define SHARED_LOCKS_REQUIRED(...) \
++  THREAD_ANNOTATION_ATTRIBUTE__(shared_locks_required(__VA_ARGS__))
+ #endif
+ 
+ #ifndef LOCKS_EXCLUDED
+-#define LOCKS_EXCLUDED(...)
++#define LOCKS_EXCLUDED(...) \
++  THREAD_ANNOTATION_ATTRIBUTE__(locks_excluded(__VA_ARGS__))
+ #endif
+ 
+ #ifndef LOCK_RETURNED
+-#define LOCK_RETURNED(x)
++#define LOCK_RETURNED(x) \
++  THREAD_ANNOTATION_ATTRIBUTE__(lock_returned(x))
+ #endif
+ 
+ #ifndef LOCKABLE
+-#define LOCKABLE
++#define LOCKABLE \
++  THREAD_ANNOTATION_ATTRIBUTE__(lockable)
+ #endif
+ 
+ #ifndef SCOPED_LOCKABLE
+-#define SCOPED_LOCKABLE
++#define SCOPED_LOCKABLE \
++  THREAD_ANNOTATION_ATTRIBUTE__(scoped_lockable)
+ #endif
+ 
+ #ifndef EXCLUSIVE_LOCK_FUNCTION
+-#define EXCLUSIVE_LOCK_FUNCTION(...)
++#define EXCLUSIVE_LOCK_FUNCTION(...) \
++  THREAD_ANNOTATION_ATTRIBUTE__(exclusive_lock_function(__VA_ARGS__))
+ #endif
+ 
+ #ifndef SHARED_LOCK_FUNCTION
+-#define SHARED_LOCK_FUNCTION(...)
++#define SHARED_LOCK_FUNCTION(...) \
++  THREAD_ANNOTATION_ATTRIBUTE__(shared_lock_function(__VA_ARGS__))
+ #endif
+ 
+ #ifndef EXCLUSIVE_TRYLOCK_FUNCTION
+-#define EXCLUSIVE_TRYLOCK_FUNCTION(...)
++#define EXCLUSIVE_TRYLOCK_FUNCTION(...) \
++  THREAD_ANNOTATION_ATTRIBUTE__(exclusive_trylock_function(__VA_ARGS__))
+ #endif
+ 
+ #ifndef SHARED_TRYLOCK_FUNCTION
+-#define SHARED_TRYLOCK_FUNCTION(...)
++#define SHARED_TRYLOCK_FUNCTION(...) \
++  THREAD_ANNOTATION_ATTRIBUTE__(shared_trylock_function(__VA_ARGS__))
+ #endif
+ 
+ #ifndef UNLOCK_FUNCTION
+-#define UNLOCK_FUNCTION(...)
++#define UNLOCK_FUNCTION(...) \
++  THREAD_ANNOTATION_ATTRIBUTE__(unlock_function(__VA_ARGS__))
+ #endif
+ 
+ #ifndef NO_THREAD_SAFETY_ANALYSIS
+-#define NO_THREAD_SAFETY_ANALYSIS
++#define NO_THREAD_SAFETY_ANALYSIS \
++  THREAD_ANNOTATION_ATTRIBUTE__(no_thread_safety_analysis)
++#endif
++
++#ifndef ASSERT_EXCLUSIVE_LOCK
++#define ASSERT_EXCLUSIVE_LOCK(...) \
++  THREAD_ANNOTATION_ATTRIBUTE__(assert_exclusive_lock(__VA_ARGS__))
++#endif
++
++#ifndef ASSERT_SHARED_LOCK
++#define ASSERT_SHARED_LOCK(...) \
++  THREAD_ANNOTATION_ATTRIBUTE__(assert_shared_lock(__VA_ARGS__))
+ #endif
+ 
+ #endif  // STORAGE_LEVELDB_PORT_THREAD_ANNOTATIONS_H_
