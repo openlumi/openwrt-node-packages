@@ -4,7 +4,7 @@ Last-Update: 2020-05-30
 
 --- a/deps/v8/AUTHORS
 +++ b/deps/v8/AUTHORS
-@@ -106,6 +106,7 @@
+@@ -108,6 +108,7 @@
  James M Snell <jasnell@gmail.com>
  Jianghua Yang <jianghua.yjh@alibaba-inc.com>
  Jiawen Geng <technicalcute@gmail.com>
@@ -14,7 +14,7 @@ Last-Update: 2020-05-30
  Jonathan Liu <net147@gmail.com>
 --- a/deps/v8/src/snapshot/embedded/platform-embedded-file-writer-aix.cc
 +++ b/deps/v8/src/snapshot/embedded/platform-embedded-file-writer-aix.cc
-@@ -94,10 +94,6 @@
+@@ -96,10 +96,6 @@
  
  void PlatformEmbeddedFileWriterAIX::DeclareFunctionEnd(const char* name) {}
  
@@ -25,7 +25,7 @@ Last-Update: 2020-05-30
  void PlatformEmbeddedFileWriterAIX::FilePrologue() {}
  
  void PlatformEmbeddedFileWriterAIX::DeclareExternalFilename(
-@@ -120,12 +116,6 @@
+@@ -122,12 +118,6 @@
    return kLong;
  }
  
@@ -41,7 +41,7 @@ Last-Update: 2020-05-30
 --- a/deps/v8/src/snapshot/embedded/platform-embedded-file-writer-aix.h
 +++ b/deps/v8/src/snapshot/embedded/platform-embedded-file-writer-aix.h
 @@ -37,8 +37,6 @@
-   void DeclareFunctionBegin(const char* name) override;
+   void DeclareFunctionBegin(const char* name, uint32_t size) override;
    void DeclareFunctionEnd(const char* name) override;
  
 -  int HexLiteral(uint64_t value) override;
@@ -134,7 +134,7 @@ Last-Update: 2020-05-30
    virtual void Newline() { fprintf(fp_, "\n"); }
 --- a/deps/v8/src/snapshot/embedded/platform-embedded-file-writer-generic.cc
 +++ b/deps/v8/src/snapshot/embedded/platform-embedded-file-writer-generic.cc
-@@ -112,10 +112,6 @@
+@@ -114,10 +114,6 @@
  
  void PlatformEmbeddedFileWriterGeneric::DeclareFunctionEnd(const char* name) {}
  
@@ -145,7 +145,7 @@ Last-Update: 2020-05-30
  void PlatformEmbeddedFileWriterGeneric::FilePrologue() {}
  
  void PlatformEmbeddedFileWriterGeneric::DeclareExternalFilename(
-@@ -142,6 +138,18 @@
+@@ -144,6 +140,18 @@
    return fprintf(fp_, "  %s ", DirectiveAsString(directive));
  }
  
@@ -167,7 +167,7 @@ Last-Update: 2020-05-30
 --- a/deps/v8/src/snapshot/embedded/platform-embedded-file-writer-generic.h
 +++ b/deps/v8/src/snapshot/embedded/platform-embedded-file-writer-generic.h
 @@ -39,8 +39,6 @@
-   void DeclareFunctionBegin(const char* name) override;
+   void DeclareFunctionBegin(const char* name, uint32_t size) override;
    void DeclareFunctionEnd(const char* name) override;
  
 -  int HexLiteral(uint64_t value) override;
@@ -186,7 +186,7 @@ Last-Update: 2020-05-30
  
 --- a/deps/v8/src/snapshot/embedded/platform-embedded-file-writer-mac.cc
 +++ b/deps/v8/src/snapshot/embedded/platform-embedded-file-writer-mac.cc
-@@ -87,10 +87,6 @@
+@@ -89,10 +89,6 @@
  
  void PlatformEmbeddedFileWriterMac::DeclareFunctionEnd(const char* name) {}
  
@@ -200,7 +200,7 @@ Last-Update: 2020-05-30
 --- a/deps/v8/src/snapshot/embedded/platform-embedded-file-writer-mac.h
 +++ b/deps/v8/src/snapshot/embedded/platform-embedded-file-writer-mac.h
 @@ -37,8 +37,6 @@
-   void DeclareFunctionBegin(const char* name) override;
+   void DeclareFunctionBegin(const char* name, uint32_t size) override;
    void DeclareFunctionEnd(const char* name) override;
  
 -  int HexLiteral(uint64_t value) override;
