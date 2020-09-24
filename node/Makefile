@@ -6,11 +6,11 @@ include $(TOPDIR)/rules.mk
 
 PKG_NAME:=node
 
-ifeq ($(CONFIG_NODEJS_10),y)
-PKG_VERSION:=v10.22.1
+ifeq ($(CONFIG_NODEJS_14),y)
+PKG_VERSION:=v14.12.0
 PKG_RELEASE:=1
-PKG_HASH:=f47f4725dcae137b26f8e2a7d0ab2c2c7f1f47e4f96834e6a9242f157132255f
-PATCH_DIR:=./patches/v10.x
+PKG_HASH:=6c345b67122257fce8000992457f59f78978dbea343a592f08d34f8580d85530
+PATCH_DIR:=./patches/v14.x
 else
 PKG_VERSION:=v12.18.4
 PKG_RELEASE:=1
@@ -113,10 +113,6 @@ define Package/node/config
 endef
 
 NODEJS_CPU:=$(subst powerpc,ppc,$(subst aarch64,arm64,$(subst x86_64,x64,$(subst i386,ia32,$(ARCH)))))
-
-ifeq ($(CONFIG_NODEJS_10),y)
-TARGET_LDFLAGS+=-latomic
-endif
 
 ifneq ($(CONFIG_ARCH_64BIT),y)
 FORCE_32BIT:=-m32
