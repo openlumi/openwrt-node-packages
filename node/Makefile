@@ -80,15 +80,15 @@ define Package/node/config
 
 	choice
 		prompt "Version Selection"
-		default NODEJS_12
+		default NODEJS_14
 		help
 		 Select node.js version.
 
-		config NODEJS_10
-			bool "10.x Maintenance LTS"
-
 		config NODEJS_12
 			bool "12.x Active LTS"
+
+		config NODEJS_14
+			bool "14.x Current"
 	endchoice
 
 	choice
