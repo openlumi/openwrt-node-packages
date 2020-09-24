@@ -22,7 +22,7 @@ diff -urN a/deps/v8/src/base/platform/condition-variable.cc b/deps/v8/src/base/p
 diff -urN a/deps/v8/src/base/platform/platform-posix.cc b/deps/v8/src/base/platform/platform-posix.cc
 --- a/deps/v8/src/base/platform/platform-posix.cc	2019-09-05 00:36:23.000000000 +0900
 +++ b/deps/v8/src/base/platform/platform-posix.cc	2019-09-12 15:10:01.063792083 +0900
-@@ -772,7 +772,7 @@
+@@ -823,7 +823,7 @@
  #if V8_OS_MACOSX
      // Default on Mac OS X is 512kB -- bump up to 1MB
      stack_size = 1 * 1024 * 1024;
@@ -46,7 +46,7 @@ diff -urN a/deps/v8/src/codegen/external-reference-table.cc b/deps/v8/src/codege
 diff -urN a/deps/v8/src/compiler-dispatcher/optimizing-compile-dispatcher.cc b/deps/v8/src/compiler-dispatcher/optimizing-compile-dispatcher.cc
 --- a/deps/v8/src/compiler-dispatcher/optimizing-compile-dispatcher.cc	2019-09-05 00:36:23.000000000 +0900
 +++ b/deps/v8/src/compiler-dispatcher/optimizing-compile-dispatcher.cc	2019-09-12 15:10:01.063792083 +0900
-@@ -134,8 +134,10 @@
+@@ -135,8 +135,10 @@
      // The function may have already been optimized by OSR.  Simply continue.
      // Use a mutex to make sure that functions marked for install
      // are always also queued.
