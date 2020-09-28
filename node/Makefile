@@ -121,6 +121,7 @@ endif
 
 MAKE_VARS+= \
 	DESTCPU=$(NODEJS_CPU) \
+	NO_LOAD=cctest.target.mk \
 	LD_LIBRARY_PATH=$(STAGING_DIR_HOSTPKG)/share/icu/current/lib
 
 CONFIGURE_VARS:= \
