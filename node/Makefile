@@ -88,7 +88,7 @@ define Package/node/config
 			bool "12.x Active LTS"
 
 		config NODEJS_14
-			depends on @!(mips||mips64)
+			depends on !(mips||mips64)
 			bool "14.x Current"
 	endchoice
 
