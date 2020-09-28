@@ -80,7 +80,7 @@ define Package/node/config
 
 	choice
 		prompt "Version Selection"
-		default NODEJS_14
+		default NODEJS_12
 		help
 		 Select node.js version.
 
@@ -88,6 +88,7 @@ define Package/node/config
 			bool "12.x Active LTS"
 
 		config NODEJS_14
+			depends on @!(mips||mips64)
 			bool "14.x Current"
 	endchoice
 
