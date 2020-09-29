@@ -124,6 +124,8 @@ MAKE_VARS+= \
 	NO_LOAD='cctest.target.mk embedtest.target.mk' \
 	LD_LIBRARY_PATH=$(STAGING_DIR_HOSTPKG)/share/icu/current/lib
 
+HOST_MAKE_VARS+=NO_LOAD='cctest.target.mk embedtest.target.mk'
+
 CONFIGURE_VARS:= \
 	CC="$(TARGET_CC) $(TARGET_OPTIMIZATION)" \
 	CXX="$(TARGET_CXX) $(TARGET_OPTIMIZATION)" \
