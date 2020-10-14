@@ -5,13 +5,16 @@
 include $(TOPDIR)/rules.mk
 
 PKG_NPM_NAME:=zigbee2mqtt
-PKG_NAME:=node-$(PKG_NPM_NAME)
-PKG_VERSION:=1.14.4
-PKG_RELEASE:=1
+PKG_NAME:=node-$(PKG_NPM_NAME)-zigate
+PKG_VERSION:=1.15.0
+PKG_RELEASE:=20201008-1
 
-PKG_SOURCE:=$(PKG_NPM_NAME)-$(PKG_VERSION).tgz
-PKG_SOURCE_URL:=https://registry.npmjs.org/$(PKG_NPM_NAME)/-/
-PKG_HASH:=525fbbd634e72605c1dff6b1b9eb3b171ab16a782441dbd3359862fba81c8283
+PKG_SOURCE_PROTO:=git
+PKG_SOURCE_URL:=https://github.com/devbis/zigbee2mqtt.git
+PKG_SOURCE_SUBDIR:=$(PKG_NAME)-$(PKG_VERSION)
+PKG_SOURCE_VERSION:=e77350f930b2ad784d9cd021991f184a2645d4df
+PKG_SOURCE:=$(PKG_NAME)-$(PKG_VERSION).tar.xz
+PKG_MIRROR_HASH:=5a961100b74e1339ab54f22b77f5ef4cd281a15ef1a17a97cc2fa7bc6f7f6794
 
 PKG_MAINTAINER:=Hirokazu MORIKAWA <morikw2@gmail.com>
 PKG_LICENSE:=GPL-3.0
@@ -23,7 +26,7 @@ PKG_USE_MIPS16:=0
 
 include $(INCLUDE_DIR)/package.mk
 
-define Package/node-zigbee2mqtt
+define Package/node-zigbee2mqtt-zigate
   SUBMENU:=Node.js
   SECTION:=lang
   CATEGORY:=Languages
@@ -44,9 +47,7 @@ TMPNPM:=$(shell mktemp -u XXXXXXXXXX)
 
 TARGET_CFLAGS+=$(FPIC)
 TARGET_CPPFLAGS+=$(FPIC)
-
-define Build/Compile
-	$(MAKE_VARS) \
+NPM_FLAGS=$(MAKE_VARS) \
 	$(MAKE_FLAGS) \
 	npm_config_arch=$(NODEJS_CPU) \
 	npm_config_target_arch=$(NODEJS_CPU) \
@@ -54,13 +55,30 @@ define Build/Compile
 	npm_config_nodedir=$(STAGING_DIR)/usr/ \
 	npm_config_prefix=$(PKG_INSTALL_DIR)/usr/ \
 	npm_config_cache=$(TMP_DIR)/npm-cache-$(TMPNPM) \
-	npm_config_tmp=$(TMP_DIR)/npm-tmp-$(TMPNPM) \
-	npm install -g $(PKG_BUILD_DIR)
+	npm_config_tmp=$(TMP_DIR)/npm-tmp-$(TMPNPM)
+
+define Build/Compile
+	$(NPM_FLAGS) npm i -g --production $(PKG_BUILD_DIR)
+	mv $(PKG_BUILD_DIR)/node_modules/zigbee-herdsman-zigate-adapter/ $(PKG_BUILD_DIR)/zigbee-herdsman-zigate-adapter/
+	rm -f $(PKG_BUILD_DIR)/zigbee-herdsman-zigate-adapter/AlreadyInstalled
+	$(NPM_FLAGS) npm install --prefix=$(PKG_BUILD_DIR)/zigbee-herdsman-zigate-adapter/
+	$(NPM_FLAGS) npm ci --production --prefix=$(PKG_BUILD_DIR)/
+	cp -r $(PKG_BUILD_DIR)/zigbee-herdsman-zigate-adapter/dist/ $(PKG_BUILD_DIR)/node_modules/zigbee-herdsman-zigate-adapter/dist/
+	rm -rf $(PKG_BUILD_DIR)/zigbee-herdsman-zigate-adapter/
+	rm -rf $(PKG_BUILD_DIR)/node_modules/zigbee-herdsman-zigate-adapter/src/
+	rm $(PKG_BUILD_DIR)/node_modules/zigbee-herdsman-zigate-adapter/npm-shrinkwrap.json 
+	rm $(PKG_BUILD_DIR)/node_modules/zigbee-herdsman-converters/npm-shrinkwrap.json 
+	rm $(PKG_BUILD_DIR)/node_modules/zigbee2mqtt-frontend/dist/report.html
+	rm $(PKG_BUILD_DIR)/node_modules/zigbee2mqtt-frontend/dist/*.map
+	rm $(PKG_BUILD_DIR)/node_modules/zigbee2mqtt-frontend/dist/*/*.map
+	rm -rf $(PKG_BUILD_DIR)/node_modules/moment/min
+	rm -rf $(PKG_BUILD_DIR)/node_modules/moment/src
+	rm -rf $(PKG_BUILD_DIR)/node_modules/moment/locale
 	rm -rf $(TMP_DIR)/npm-tmp-$(TMPNPM)
 	rm -rf $(TMP_DIR)/npm-cache-$(TMPNPM)
 endef
 
-define Package/node-zigbee2mqtt/install
+define Package/node-zigbee2mqtt-zigate/install
 	$(INSTALL_DIR) $(1)/opt/$(PKG_NPM_NAME)
 	$(CP) $(PKG_INSTALL_DIR)/usr/lib/node_modules/$(PKG_NPM_NAME)/{package.json,LICENSE} \
 		$(1)/opt/$(PKG_NPM_NAME)/
@@ -74,4 +92,4 @@ define Package/node-zigbee2mqtt/install
 	$(INSTALL_BIN) ./files/zigbee2mqtt.init $(1)/etc/init.d/zigbee2mqtt
 endef
 
-$(eval $(call BuildPackage,node-zigbee2mqtt))
+$(eval $(call BuildPackage,node-zigbee2mqtt-zigate))
