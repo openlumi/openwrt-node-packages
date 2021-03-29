@@ -6,12 +6,12 @@ include $(TOPDIR)/rules.mk
 
 PKG_NPM_NAME:=zigbee2mqtt
 PKG_NAME:=node-$(PKG_NPM_NAME)
-PKG_VERSION:=1.17.0
+PKG_VERSION:=1.18.1
 PKG_RELEASE:=1
 
 PKG_SOURCE:=$(PKG_NPM_NAME)-$(PKG_VERSION).tgz
 PKG_SOURCE_URL:=https://registry.npmjs.org/$(PKG_NPM_NAME)/-/
-PKG_HASH:=e19ee8027c56bad411c3386b8a35da1f3d3575cac0fb76e2807cfb9492f02ee5
+PKG_HASH:=6a2bf71a3d6e73d8da167e4f87af341d59f4cf40e94d2eefefc3c79d708a52f4
 
 PKG_MAINTAINER:=Hirokazu MORIKAWA <morikw2@gmail.com>
 PKG_LICENSE:=GPL-3.0
@@ -44,7 +44,9 @@ TMPNPM:=$(shell mktemp -u XXXXXXXXXX)
 
 TARGET_CFLAGS+=$(FPIC)
 TARGET_CPPFLAGS+=$(FPIC)
-NPM_FLAGS=$(MAKE_VARS) \
+
+define Build/Compile
+	$(MAKE_VARS) \
 	$(MAKE_FLAGS) \
 	npm_config_arch=$(NODEJS_CPU) \
 	npm_config_target_arch=$(NODEJS_CPU) \
@@ -52,11 +54,8 @@ NPM_FLAGS=$(MAKE_VARS) \
 	npm_config_nodedir=$(STAGING_DIR)/usr/ \
 	npm_config_prefix=$(PKG_INSTALL_DIR)/usr/ \
 	npm_config_cache=$(TMP_DIR)/npm-cache-$(TMPNPM) \
-	npm_config_tmp=$(TMP_DIR)/npm-tmp-$(TMPNPM)
-
-define Build/Compile
-	$(NPM_FLAGS) npm i -g --production $(PKG_BUILD_DIR)
-	$(NPM_FLAGS) npm ci --production --prefix=$(PKG_BUILD_DIR)/
+	npm_config_tmp=$(TMP_DIR)/npm-tmp-$(TMPNPM) \
+	npm install -g --production $(PKG_BUILD_DIR)
 	rm $(PKG_BUILD_DIR)/node_modules/zigbee-herdsman/npm-shrinkwrap.json
 	rm $(PKG_BUILD_DIR)/node_modules/zigbee-herdsman-converters/npm-shrinkwrap.json
 	rm -f $(PKG_BUILD_DIR)/node_modules/zigbee2mqtt-frontend/dist/report.html
